@@ -266,7 +266,7 @@ def create_train_state(model_cls,
 
     fn_is_complex = lambda x: x.dtype in [np.complex64, np.complex128]
     param_sizes = map_nested_fn(lambda k, param: param.size * (2 if fn_is_complex(param) else 1))(params)
-    print(f"[*] Trainable Parameters: {sum(jax.tree_leaves(param_sizes))}")
+    print(f"[*] Trainable Parameters: {sum(jax.tree_util.tree_leaves(param_sizes))}")
 
     if batchnorm:
         class TrainState(train_state.TrainState):
