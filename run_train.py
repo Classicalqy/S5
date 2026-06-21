@@ -125,9 +125,15 @@ if __name__ == "__main__":
 
 	# Synthetic frequency task parameters.
 	parser.add_argument("--synthetic_seq_len", type=int, default=256)
-	parser.add_argument("--synthetic_noise_std", type=float, default=0.1)
-	parser.add_argument("--synthetic_low_freq_range", type=float, nargs=2, default=[1.0, 3.0])
-	parser.add_argument("--synthetic_high_freq_range", type=float, nargs=2, default=[8.0, 12.0])
+	parser.add_argument("--synthetic_noise_std", type=float, default=0.25)
+	parser.add_argument("--synthetic_low_freq_range", type=float, nargs=2, default=[4.0, 6.0])
+	parser.add_argument("--synthetic_high_freq_range", type=float, nargs=2, default=[7.0, 9.0])
+	parser.add_argument("--synthetic_amplitude_range", type=float, nargs=2, default=[0.5, 1.5])
+	parser.add_argument("--synthetic_bias_range", type=float, nargs=2, default=[-0.3, 0.3])
+	parser.add_argument("--synthetic_trend_range", type=float, nargs=2, default=[-0.3, 0.3])
+	parser.add_argument("--synthetic_distractor_count", type=int, default=1)
+	parser.add_argument("--synthetic_distractor_freq_range", type=float, nargs=2, default=[1.0, 12.0])
+	parser.add_argument("--synthetic_distractor_amp_range", type=float, nargs=2, default=[0.0, 0.4])
 	parser.add_argument("--synthetic_num_train", type=int, default=1000)
 	parser.add_argument("--synthetic_num_val", type=int, default=200)
 	parser.add_argument("--synthetic_num_test", type=int, default=200)

@@ -391,13 +391,25 @@ def create_synthetic_frequency_classification_dataset(cache_dir: Union[str, Path
 													  seed: int = 42,
 													  bsz: int = 128,
 													  seq_len: int = 256,
-													  noise_std: float = 0.1,
-													  low_freq_range=(1.0, 3.0),
-													  high_freq_range=(8.0, 12.0),
+													  noise_std: float = 0.25,
+													  low_freq_range=(4.0, 6.0),
+													  high_freq_range=(7.0, 9.0),
+													  amplitude_range=(0.5, 1.5),
+													  bias_range=(-0.3, 0.3),
+													  trend_range=(-0.3, 0.3),
+													  distractor_count: int = 1,
+													  distractor_freq_range=(1.0, 12.0),
+													  distractor_amp_range=(0.0, 0.4),
 													  num_train: int = 1000,
 													  num_val: int = 200,
 													  num_test: int = 200) -> ReturnType:
-	"""Binary low-vs-high sinusoid classification for frequency selectivity."""
+	"""Binary low-vs-high sinusoid classification for frequency selectivity.
+
+	The default task is intentionally moderately noisy: nearby frequency bands,
+	random amplitude, DC offset, slow drift, and an unrelated sinusoidal
+	distractor.  This makes the task less solvable by simple magnitude or mean
+	statistics and puts more pressure on frequency-selective dynamics.
+	"""
 	print("[*] Generating Synthetic Frequency Classification Dataset")
 
 	def make_split(num_samples, split_seed):
@@ -406,13 +418,35 @@ def create_synthetic_frequency_classification_dataset(cache_dir: Union[str, Path
 		labels = torch.randint(0, 2, (num_samples,), generator=gen)
 		low = torch.tensor(low_freq_range, dtype=torch.float32)
 		high = torch.tensor(high_freq_range, dtype=torch.float32)
+		amp_range = torch.tensor(amplitude_range, dtype=torch.float32)
+		bias_rng = torch.tensor(bias_range, dtype=torch.float32)
+		trend_rng = torch.tensor(trend_range, dtype=torch.float32)
+		distractor_freq_rng = torch.tensor(distractor_freq_range, dtype=torch.float32)
+		distractor_amp_rng = torch.tensor(distractor_amp_range, dtype=torch.float32)
 		rand_freq = torch.rand(num_samples, generator=gen)
 		low_freq = low[0] + rand_freq * (low[1] - low[0])
 		high_freq = high[0] + rand_freq * (high[1] - high[0])
 		freq = torch.where(labels == 0, low_freq, high_freq)
 		phase = 2 * torch.pi * torch.rand(num_samples, generator=gen)
 		t = torch.linspace(0.0, 1.0, seq_len)
-		signal = torch.sin(2 * torch.pi * freq[:, None] * t[None, :] + phase[:, None])
+		amplitude = amp_range[0] + torch.rand(num_samples, generator=gen) * (amp_range[1] - amp_range[0])
+		bias = bias_rng[0] + torch.rand(num_samples, generator=gen) * (bias_rng[1] - bias_rng[0])
+		trend = trend_rng[0] + torch.rand(num_samples, generator=gen) * (trend_rng[1] - trend_rng[0])
+		signal = amplitude[:, None] * torch.sin(2 * torch.pi * freq[:, None] * t[None, :] + phase[:, None])
+
+		for _ in range(distractor_count):
+			d_freq = distractor_freq_rng[0] + torch.rand(num_samples, generator=gen) * (
+				distractor_freq_rng[1] - distractor_freq_rng[0]
+			)
+			d_amp = distractor_amp_rng[0] + torch.rand(num_samples, generator=gen) * (
+				distractor_amp_rng[1] - distractor_amp_rng[0]
+			)
+			d_phase = 2 * torch.pi * torch.rand(num_samples, generator=gen)
+			signal = signal + d_amp[:, None] * torch.sin(
+				2 * torch.pi * d_freq[:, None] * t[None, :] + d_phase[:, None]
+			)
+
+		signal = signal + bias[:, None] + trend[:, None] * (t[None, :] - 0.5)
 		noise = noise_std * torch.randn(num_samples, seq_len, generator=gen)
 		x = (signal + noise).unsqueeze(-1).float()
 		y = labels.long()

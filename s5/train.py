@@ -85,6 +85,12 @@ def train(args):
                             noise_std=args.synthetic_noise_std,
                             low_freq_range=args.synthetic_low_freq_range,
                             high_freq_range=args.synthetic_high_freq_range,
+                            amplitude_range=args.synthetic_amplitude_range,
+                            bias_range=args.synthetic_bias_range,
+                            trend_range=args.synthetic_trend_range,
+                            distractor_count=args.synthetic_distractor_count,
+                            distractor_freq_range=args.synthetic_distractor_freq_range,
+                            distractor_amp_range=args.synthetic_distractor_amp_range,
                             num_train=args.synthetic_num_train,
                             num_val=args.synthetic_num_val,
                             num_test=args.synthetic_num_test)

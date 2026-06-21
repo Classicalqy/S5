@@ -151,12 +151,32 @@ Defaults:
 
 ```text
 seq_len: 256
-noise_std: 0.1
-low_freq_range: [1, 3]
-high_freq_range: [8, 12]
+noise_std: 0.25
+low_freq_range: [4, 6]
+high_freq_range: [7, 9]
+amplitude_range: [0.5, 1.5]
+bias_range: [-0.3, 0.3]
+trend_range: [-0.3, 0.3]
+distractor_count: 1
+distractor_freq_range: [1, 12]
+distractor_amp_range: [0, 0.4]
 num_train: 1000
 num_val: 200
 num_test: 200
+```
+
+To make the task harder, move the frequency bands closer and increase nuisance
+variation:
+
+```bash
+python run_train.py \
+  --dataset synthetic_frequency-classification \
+  --ssm_param resonant_2x2 \
+  --synthetic_low_freq_range 5.0 6.0 \
+  --synthetic_high_freq_range 6.5 7.5 \
+  --synthetic_noise_std 0.35 \
+  --synthetic_distractor_count 2 \
+  --synthetic_distractor_amp_range 0.0 0.6
 ```
 
 ## Result Table Template
