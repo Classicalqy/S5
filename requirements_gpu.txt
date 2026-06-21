@@ -6,4 +6,4 @@ pydub==0.25.1
 datasets
 tqdm
 --find-links https://storage.googleapis.com/jax-releases/jax_releases.html
-jax[cuda]>=version
+jax[cuda12]>=0.4.28
