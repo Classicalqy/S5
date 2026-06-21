@@ -8,6 +8,13 @@ import optax
 from typing import Any, Tuple
 
 
+SSM_PARAMETER_NAMES = [
+    "B", "Lambda_re", "Lambda_im", "log_step", "norm",
+    "raw_alpha", "omega", "raw_q",
+]
+SSM_WITH_C_PARAMETER_NAMES = SSM_PARAMETER_NAMES + ["C", "C1", "C2", "D"]
+
+
 # LR schedulers
 def linear_warmup(step, base_lr, end_step, lr_min=None):
     return base_lr * (step + 1) / end_step
@@ -146,14 +153,14 @@ def create_train_state(model_cls,
         if dt_global:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
-                if k in ["B", "Lambda_re", "Lambda_im", "norm"]
+                if k in [p for p in SSM_PARAMETER_NAMES if p != "log_step"]
                 else ("none" if k in [] else "regular")
             )
 
         else:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
-                if k in ["B", "Lambda_re", "Lambda_im", "log_step", "norm"]
+                if k in SSM_PARAMETER_NAMES
                 else ("none" if k in [] else "regular")
             )
         tx = optax.multi_transform(
@@ -173,14 +180,14 @@ def create_train_state(model_cls,
         if dt_global:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
-                if k in ["Lambda_re", "Lambda_im", "norm"]
+                if k in [p for p in SSM_PARAMETER_NAMES if p not in ["B", "log_step"]]
                 else ("none" if k in ["B"] else "regular")
             )
 
         else:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
-                if k in ["Lambda_re", "Lambda_im", "log_step", "norm"]
+                if k in [p for p in SSM_PARAMETER_NAMES if p != "B"]
                 else ("none" if k in ["B"] else "regular")
             )
         tx = optax.multi_transform(
@@ -202,13 +209,13 @@ def create_train_state(model_cls,
         if dt_global:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
-                if k in ["Lambda_re", "Lambda_im", "norm"]
+                if k in [p for p in SSM_PARAMETER_NAMES if p not in ["B", "log_step"]]
                 else ("none" if k in [] else "regular")
             )
         else:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
-                if k in ["Lambda_re", "Lambda_im", "log_step", "norm"]
+                if k in [p for p in SSM_PARAMETER_NAMES if p != "B"]
                 else ("none" if k in [] else "regular")
             )
         tx = optax.multi_transform(
@@ -229,15 +236,13 @@ def create_train_state(model_cls,
         if dt_global:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
-                if k in ["B", "C", "C1", "C2", "D",
-                         "Lambda_re", "Lambda_im", "norm"]
+                if k in [p for p in SSM_WITH_C_PARAMETER_NAMES if p != "log_step"]
                 else ("none" if k in [] else "regular")
             )
         else:
             ssm_fn = map_nested_fn(
                 lambda k, _: "ssm"
-                if k in ["B", "C", "C1", "C2", "D",
-                         "Lambda_re", "Lambda_im", "log_step", "norm"]
+                if k in SSM_WITH_C_PARAMETER_NAMES
                 else ("none" if k in [] else "regular")
             )
         tx = optax.multi_transform(

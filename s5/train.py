@@ -10,6 +10,14 @@ from .dataloading import Datasets
 from .seq_model import BatchClassificationModel, RetrievalModel
 from .ssm import init_S5SSM
 from .ssm_init import make_DPLR_HiPPO
+from .ssm_parameterizations import (
+    SSM_PARAM_ORIGINAL,
+    SSM_PARAM_ORIGINAL_NO_D,
+    effective_use_D,
+    init_RealValuedSSM,
+    is_hardware_friendly,
+    summarize_state_space,
+)
 
 
 def train(args):
@@ -28,6 +36,7 @@ def train(args):
 
     ssm_size = args.ssm_size_base
     ssm_lr = args.ssm_lr_base
+    use_D = effective_use_D(args.ssm_param, args.use_D)
 
     # determine the size of initial blocks
     block_size = int(ssm_size / args.blocks)
@@ -67,45 +76,73 @@ def train(args):
 
     # Create dataset...
     init_rng, key = random.split(init_rng, num=2)
-    trainloader, valloader, testloader, aux_dataloaders, n_classes, seq_len, in_dim, train_size = \
-      create_dataset_fn(args.dir_name, seed=args.jax_seed, bsz=args.bsz)
+    if args.dataset in ["synthetic_frequency-classification"]:
+        trainloader, valloader, testloader, aux_dataloaders, n_classes, seq_len, in_dim, train_size = \
+          create_dataset_fn(args.dir_name,
+                            seed=args.jax_seed,
+                            bsz=args.bsz,
+                            seq_len=args.synthetic_seq_len,
+                            noise_std=args.synthetic_noise_std,
+                            low_freq_range=args.synthetic_low_freq_range,
+                            high_freq_range=args.synthetic_high_freq_range,
+                            num_train=args.synthetic_num_train,
+                            num_val=args.synthetic_num_val,
+                            num_test=args.synthetic_num_test)
+    else:
+        trainloader, valloader, testloader, aux_dataloaders, n_classes, seq_len, in_dim, train_size = \
+          create_dataset_fn(args.dir_name, seed=args.jax_seed, bsz=args.bsz)
 
     print(f"[*] Starting S5 Training on `{args.dataset}` =>> Initializing...")
 
-    # Initialize state matrix A using approximation to HiPPO-LegS matrix
-    Lambda, _, B, V, B_orig = make_DPLR_HiPPO(block_size)
+    if is_hardware_friendly(args.ssm_param):
+        if args.conj_sym:
+            print("[!] conj_sym is ignored for real-valued hardware-friendly parameterizations.")
+        ssm_init_fn = init_RealValuedSSM(H=args.d_model,
+                                         P=ssm_size,
+                                         ssm_param=args.ssm_param,
+                                         discretization=args.discretization,
+                                         dt_min=args.dt_min,
+                                         dt_max=args.dt_max,
+                                         bidirectional=args.bidirectional)
+    else:
+        if args.ssm_param not in [SSM_PARAM_ORIGINAL, SSM_PARAM_ORIGINAL_NO_D]:
+            raise ValueError("Unknown ssm_param {}".format(args.ssm_param))
 
-    if args.conj_sym:
-        block_size = block_size // 2
-        ssm_size = ssm_size // 2
+        # Initialize state matrix A using approximation to HiPPO-LegS matrix.
+        Lambda, _, B, V, B_orig = make_DPLR_HiPPO(block_size)
 
-    Lambda = Lambda[:block_size]
-    V = V[:, :block_size]
-    Vc = V.conj().T
+        if args.conj_sym:
+            block_size = block_size // 2
+            ssm_size = ssm_size // 2
 
-    # If initializing state matrix A as block-diagonal, put HiPPO approximation
-    # on each block
-    Lambda = (Lambda * np.ones((args.blocks, block_size))).ravel()
-    V = block_diag(*([V] * args.blocks))
-    Vinv = block_diag(*([Vc] * args.blocks))
+        Lambda = Lambda[:block_size]
+        V = V[:, :block_size]
+        Vc = V.conj().T
 
-    print("Lambda.shape={}".format(Lambda.shape))
-    print("V.shape={}".format(V.shape))
-    print("Vinv.shape={}".format(Vinv.shape))
+        # If initializing state matrix A as block-diagonal, put HiPPO approximation
+        # on each block.
+        Lambda = (Lambda * np.ones((args.blocks, block_size))).ravel()
+        V = block_diag(*([V] * args.blocks))
+        Vinv = block_diag(*([Vc] * args.blocks))
 
-    ssm_init_fn = init_S5SSM(H=args.d_model,
-                             P=ssm_size,
-                             Lambda_re_init=Lambda.real,
-                             Lambda_im_init=Lambda.imag,
-                             V=V,
-                             Vinv=Vinv,
-                             C_init=args.C_init,
-                             discretization=args.discretization,
-                             dt_min=args.dt_min,
-                             dt_max=args.dt_max,
-                             conj_sym=args.conj_sym,
-                             clip_eigs=args.clip_eigs,
-                             bidirectional=args.bidirectional)
+        print("Lambda.shape={}".format(Lambda.shape))
+        print("V.shape={}".format(V.shape))
+        print("Vinv.shape={}".format(Vinv.shape))
+
+        ssm_init_fn = init_S5SSM(H=args.d_model,
+                                 P=ssm_size,
+                                 Lambda_re_init=Lambda.real,
+                                 Lambda_im_init=Lambda.imag,
+                                 V=V,
+                                 Vinv=Vinv,
+                                 C_init=args.C_init,
+                                 discretization=args.discretization,
+                                 dt_min=args.dt_min,
+                                 dt_max=args.dt_max,
+                                 conj_sym=args.conj_sym,
+                                 clip_eigs=args.clip_eigs,
+                                 bidirectional=args.bidirectional,
+                                 use_D=use_D)
 
     if retrieval:
         # Use retrieval head for AAN task
@@ -154,6 +191,23 @@ def train(args):
                                ssm_lr=ssm_lr,
                                lr=lr,
                                dt_global=args.dt_global)
+
+    ssm_summary = summarize_state_space(state.params, args, use_D)
+    print("[*] SSM configuration summary:")
+    for key, value in ssm_summary.items():
+        print("    {}: {}".format(key, value))
+    if is_hardware_friendly(args.ssm_param):
+        if not ssm_summary["B_real"]:
+            print("[!] Hardware-friendly run has complex B.")
+        if not ssm_summary["C_real"]:
+            print("[!] Hardware-friendly run has complex C.")
+        if ssm_summary["D_enabled"]:
+            print("[!] Hardware-friendly run has nonzero D enabled.")
+        if not ssm_summary["A_real_block_equivalent"]:
+            print("[!] Hardware-friendly run lacks a real-valued A interpretation.")
+    if wandb.run is not None:
+        wandb.run.summary.update(ssm_summary)
+        wandb.log({k: v for k, v in ssm_summary.items() if isinstance(v, (int, float, bool))})
 
     # Training Loop over epochs
     best_loss, best_acc, best_epoch = 100000000, -100000000.0, 0  # This best loss is val_loss

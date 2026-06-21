@@ -387,11 +387,55 @@ def create_pmnist_classification_dataset(cache_dir: Union[str, Path] = DEFAULT_C
 	return trn_loader, val_loader, tst_loader, aux_loaders, N_CLASSES, SEQ_LENGTH, IN_DIM, TRAIN_SIZE
 
 
+def create_synthetic_frequency_classification_dataset(cache_dir: Union[str, Path] = DEFAULT_CACHE_DIR_ROOT,
+													  seed: int = 42,
+													  bsz: int = 128,
+													  seq_len: int = 256,
+													  noise_std: float = 0.1,
+													  low_freq_range=(1.0, 3.0),
+													  high_freq_range=(8.0, 12.0),
+													  num_train: int = 1000,
+													  num_val: int = 200,
+													  num_test: int = 200) -> ReturnType:
+	"""Binary low-vs-high sinusoid classification for frequency selectivity."""
+	print("[*] Generating Synthetic Frequency Classification Dataset")
+
+	def make_split(num_samples, split_seed):
+		gen = torch.Generator()
+		gen.manual_seed(split_seed)
+		labels = torch.randint(0, 2, (num_samples,), generator=gen)
+		low = torch.tensor(low_freq_range, dtype=torch.float32)
+		high = torch.tensor(high_freq_range, dtype=torch.float32)
+		rand_freq = torch.rand(num_samples, generator=gen)
+		low_freq = low[0] + rand_freq * (low[1] - low[0])
+		high_freq = high[0] + rand_freq * (high[1] - high[0])
+		freq = torch.where(labels == 0, low_freq, high_freq)
+		phase = 2 * torch.pi * torch.rand(num_samples, generator=gen)
+		t = torch.linspace(0.0, 1.0, seq_len)
+		signal = torch.sin(2 * torch.pi * freq[:, None] * t[None, :] + phase[:, None])
+		noise = noise_std * torch.randn(num_samples, seq_len, generator=gen)
+		x = (signal + noise).unsqueeze(-1).float()
+		y = labels.long()
+		return torch.utils.data.TensorDataset(x, y)
+
+	trainset = make_split(num_train, seed)
+	valset = make_split(num_val, seed + 1)
+	testset = make_split(num_test, seed + 2)
+
+	trainloader = make_data_loader(trainset, None, seed=seed, batch_size=bsz)
+	valloader = make_data_loader(valset, None, seed=seed, batch_size=bsz, drop_last=False, shuffle=False)
+	testloader = make_data_loader(testset, None, seed=seed, batch_size=bsz, drop_last=False, shuffle=False)
+
+	aux_loaders = {}
+	return trainloader, valloader, testloader, aux_loaders, 2, seq_len, 1, num_train
+
+
 Datasets = {
 	# Other loaders.
 	"mnist-classification": create_mnist_classification_dataset,
 	"pmnist-classification": create_pmnist_classification_dataset,
 	"cifar-classification": create_cifar_classification_dataset,
+	"synthetic_frequency-classification": create_synthetic_frequency_classification_dataset,
 
 	# LRA.
 	"imdb-classification": create_lra_imdb_classification_dataset,

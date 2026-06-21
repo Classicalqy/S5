@@ -1,7 +1,27 @@
 import argparse
+import sys
 from s5.utils.util import str2bool
 from s5.train import train
 from s5.dataloading import Datasets
+from s5.ssm_parameterizations import SSM_PARAM_CHOICES
+
+
+def normalize_config_overrides(argv):
+	"""Accept lightweight Hydra-style overrides used in experiment notes."""
+	aliases = {
+		"model.ssm_param": "ssm_param",
+		"model.use_D": "use_D",
+		"seed": "jax_seed",
+	}
+	normalized = []
+	for arg in argv:
+		if "=" in arg and not arg.startswith("--"):
+			key, value = arg.split("=", 1)
+			key = aliases.get(key, key.replace("model.", ""))
+			normalized.extend([f"--{key}", value])
+		else:
+			normalized.append(arg)
+	return normalized
 
 if __name__ == "__main__":
 
@@ -27,6 +47,11 @@ if __name__ == "__main__":
 							 "dimension of layer inputs/outputs")
 	parser.add_argument("--ssm_size_base", type=int, default=256,
 						help="SSM Latent size, i.e. P")
+	parser.add_argument("--ssm_param", type=str, default="original",
+						choices=SSM_PARAM_CHOICES,
+						help="State dynamics parameterization")
+	parser.add_argument("--use_D", type=str2bool, default=True,
+						help="Use direct feedthrough D for original S5. Forced false for no-D and hardware-friendly variants.")
 	parser.add_argument("--blocks", type=int, default=8,
 						help="How many blocks, J, to initialize with")
 	parser.add_argument("--C_init", type=str, default="trunc_standard_normal",
@@ -98,4 +123,13 @@ if __name__ == "__main__":
 	parser.add_argument("--jax_seed", type=int, default=1919,
 						help="seed randomness")
 
-	train(parser.parse_args())
+	# Synthetic frequency task parameters.
+	parser.add_argument("--synthetic_seq_len", type=int, default=256)
+	parser.add_argument("--synthetic_noise_std", type=float, default=0.1)
+	parser.add_argument("--synthetic_low_freq_range", type=float, nargs=2, default=[1.0, 3.0])
+	parser.add_argument("--synthetic_high_freq_range", type=float, nargs=2, default=[8.0, 12.0])
+	parser.add_argument("--synthetic_num_train", type=int, default=1000)
+	parser.add_argument("--synthetic_num_val", type=int, default=200)
+	parser.add_argument("--synthetic_num_test", type=int, default=200)
+
+	train(parser.parse_args(normalize_config_overrides(sys.argv[1:])))

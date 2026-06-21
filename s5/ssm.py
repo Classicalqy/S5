@@ -1,4 +1,5 @@
 from functools import partial
+from typing import Any
 import jax
 import jax.numpy as np
 from flax import linen as nn
@@ -89,10 +90,10 @@ def apply_ssm(Lambda_bar, B_bar, C_tilde, input_sequence, conj_sym, bidirectiona
 
 
 class S5SSM(nn.Module):
-    Lambda_re_init: np.DeviceArray
-    Lambda_im_init: np.DeviceArray
-    V: np.DeviceArray
-    Vinv: np.DeviceArray
+    Lambda_re_init: Any
+    Lambda_im_init: Any
+    V: Any
+    Vinv: Any
 
     H: int
     P: int
@@ -103,6 +104,7 @@ class S5SSM(nn.Module):
     conj_sym: bool = True
     clip_eigs: bool = False
     bidirectional: bool = False
+    use_D: bool = True
     step_rescale: float = 1.0
 
     """ The S5 SSM
@@ -209,8 +211,13 @@ class S5SSM(nn.Module):
 
                 self.C_tilde = self.C[..., 0] + 1j * self.C[..., 1]
 
-        # Initialize feedthrough (D) matrix
-        self.D = self.param("D", normal(stddev=1.0), (self.H,))
+        # Initialize feedthrough (D) matrix.  The original S5 path keeps this
+        # enabled by default; no-D ablations set use_D=False and omit the
+        # trainable direct feedthrough parameter entirely.
+        if self.use_D:
+            self.D = self.param("D", normal(stddev=1.0), (self.H,))
+        else:
+            self.D = np.zeros((self.H,))
 
         # Initialize learnable discretization timescale value
         self.log_step = self.param("log_step",
@@ -242,7 +249,10 @@ class S5SSM(nn.Module):
                        self.conj_sym,
                        self.bidirectional)
 
-        # Add feedthrough matrix output Du;
+        if not self.use_D:
+            return ys
+
+        # Add feedthrough matrix output Du.
         Du = jax.vmap(lambda u: self.D * u)(input_sequence)
         return ys + Du
 
@@ -259,7 +269,8 @@ def init_S5SSM(H,
                dt_max,
                conj_sym,
                clip_eigs,
-               bidirectional
+               bidirectional,
+               use_D=True
                ):
     """Convenience function that will be used to initialize the SSM.
        Same arguments as defined in S5SSM above."""
@@ -276,4 +287,5 @@ def init_S5SSM(H,
                    dt_max=dt_max,
                    conj_sym=conj_sym,
                    clip_eigs=clip_eigs,
-                   bidirectional=bidirectional)
+                   bidirectional=bidirectional,
+                   use_D=use_D)
