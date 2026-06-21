@@ -77,6 +77,14 @@ if __name__ == "__main__":
 						help="min value to sample initial timescale params from")
 	parser.add_argument("--dt_max", type=float, default=0.1,
 						help="max value to sample initial timescale params from")
+	parser.add_argument("--plot_ssm_diagnostics", type=str2bool, default=False,
+						help="save learned SSM eigenvalue and frequency-response plots after training")
+	parser.add_argument("--fig_dir", type=str, default="./figs",
+						help="directory for SSM diagnostic figures")
+	parser.add_argument("--fig_dpi", type=int, default=200,
+						help="DPI for SSM diagnostic figures")
+	parser.add_argument("--freq_response_points", type=int, default=256,
+						help="number of frequency grid points for SSM diagnostic plots")
 
 	# Optimization Parameters
 	parser.add_argument("--prenorm", type=str2bool, default=True,

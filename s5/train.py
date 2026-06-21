@@ -18,6 +18,7 @@ from .ssm_parameterizations import (
     is_hardware_friendly,
     summarize_state_space,
 )
+from .diagnostics import plot_ssm_diagnostics
 
 
 def train(args):
@@ -399,3 +400,6 @@ def train(args):
 
         if count > args.early_stop_patience:
             break
+
+    if getattr(args, "plot_ssm_diagnostics", False):
+        plot_ssm_diagnostics(state.params, args)
