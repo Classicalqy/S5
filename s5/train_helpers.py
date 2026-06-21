@@ -87,6 +87,15 @@ def map_nested_fn(fn):
     return map_fn
 
 
+def maybe_unfreeze(tree):
+    """Return a mutable parameter tree across Flax versions.
+
+    Older Flax returns FrozenDicts with an .unfreeze() method, while newer
+    versions may already return ordinary dicts from model.init().
+    """
+    return tree.unfreeze() if hasattr(tree, "unfreeze") else tree
+
+
 def create_train_state(model_cls,
                        rng,
                        padded,
@@ -139,10 +148,10 @@ def create_train_state(model_cls,
                            dummy_input, integration_timesteps,
                            )
     if batchnorm:
-        params = variables["params"].unfreeze()
+        params = maybe_unfreeze(variables["params"])
         batch_stats = variables["batch_stats"]
     else:
-        params = variables["params"].unfreeze()
+        params = maybe_unfreeze(variables["params"])
         # Note: `unfreeze()` is for using Optax.
 
     if opt_config in ["standard"]:
