@@ -15,11 +15,11 @@ for seed in 0 1 2 3 4; do
     echo "Running ssm_param=$p seed=$seed"
 
     python run_train.py \
-      dataset=synthetic_frequency-classification \
+      dataset=mnist-classification \
       model.ssm_param=$p \
       n_layers=2 \
-      d_model=8 \
-      ssm_size_base=16 \
+      d_model=16 \
+      ssm_size_base=32 \
       blocks=1 \
       batchnorm=False \
       p_dropout=0.1 \
