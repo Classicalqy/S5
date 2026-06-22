@@ -518,27 +518,46 @@ def create_ucr_classification_dataset(dataset_name: str,
 									  cache_dir: Union[str, Path] = DEFAULT_CACHE_DIR_ROOT,
 									  seed: int = 42,
 									  bsz: int = 128,
-									  val_split: float = 0.1) -> ReturnType:
-	print(f"[*] Generating UCR-{dataset_name} Classification Dataset")
+									  val_split: float = 0.1,
+									  split_mode: str = "standard") -> ReturnType:
+	print(f"[*] Generating UCR-{dataset_name} Classification Dataset ({split_mode} split)")
 
 	train_path = _resolve_ucr_split_file(cache_dir, dataset_name, "TRAIN")
 	test_path = _resolve_ucr_split_file(cache_dir, dataset_name, "TEST")
 	full_trainset, label_to_index = _load_ucr_tsv(train_path)
-	testset, _ = _load_ucr_tsv(test_path, label_to_index)
+	full_testset, _ = _load_ucr_tsv(test_path, label_to_index)
 
 	if not 0.0 < val_split < 1.0:
 		raise ValueError(f"val_split must be between 0 and 1, got {val_split}")
 
-	val_size = max(1, int(len(full_trainset) * val_split))
-	train_size = len(full_trainset) - val_size
-	if train_size < 1:
-		raise ValueError(f"UCR {dataset_name} TRAIN split is too small for val_split={val_split}")
+	if split_mode == "standard":
+		val_size = max(1, int(len(full_trainset) * val_split))
+		train_size = len(full_trainset) - val_size
+		if train_size < 1:
+			raise ValueError(f"UCR {dataset_name} TRAIN split is too small for val_split={val_split}")
 
-	trainset, valset = torch.utils.data.random_split(
-		full_trainset,
-		(train_size, val_size),
-		generator=torch.Generator().manual_seed(seed),
-	)
+		trainset, valset = torch.utils.data.random_split(
+			full_trainset,
+			(train_size, val_size),
+			generator=torch.Generator().manual_seed(seed),
+		)
+		testset = full_testset
+	elif split_mode == "combined":
+		full_dataset = torch.utils.data.ConcatDataset([full_trainset, full_testset])
+		total_size = len(full_dataset)
+		train_size = int(0.8 * total_size)
+		val_size = int(0.1 * total_size)
+		test_size = total_size - train_size - val_size
+		if min(train_size, val_size, test_size) < 1:
+			raise ValueError(f"UCR {dataset_name} combined split is too small for 80/10/10.")
+
+		trainset, valset, testset = torch.utils.data.random_split(
+			full_dataset,
+			(train_size, val_size, test_size),
+			generator=torch.Generator().manual_seed(seed),
+		)
+	else:
+		raise ValueError(f"Unknown UCR split_mode {split_mode}. Expected 'standard' or 'combined'.")
 
 	trainloader = make_data_loader(trainset, None, seed=seed, batch_size=bsz)
 	valloader = make_data_loader(valset, None, seed=seed, batch_size=bsz, drop_last=False, shuffle=False)
@@ -552,20 +571,23 @@ def create_ucr_classification_dataset(dataset_name: str,
 
 def create_ucr_ecg5000_classification_dataset(cache_dir: Union[str, Path] = DEFAULT_CACHE_DIR_ROOT,
 											  seed: int = 42,
-											  bsz: int = 128) -> ReturnType:
-	return create_ucr_classification_dataset("ECG5000", cache_dir=cache_dir, seed=seed, bsz=bsz)
+											  bsz: int = 128,
+											  split_mode: str = "standard") -> ReturnType:
+	return create_ucr_classification_dataset("ECG5000", cache_dir=cache_dir, seed=seed, bsz=bsz, split_mode=split_mode)
 
 
 def create_ucr_forda_classification_dataset(cache_dir: Union[str, Path] = DEFAULT_CACHE_DIR_ROOT,
 											seed: int = 42,
-											bsz: int = 128) -> ReturnType:
-	return create_ucr_classification_dataset("FordA", cache_dir=cache_dir, seed=seed, bsz=bsz)
+											bsz: int = 128,
+											split_mode: str = "standard") -> ReturnType:
+	return create_ucr_classification_dataset("FordA", cache_dir=cache_dir, seed=seed, bsz=bsz, split_mode=split_mode)
 
 
 def create_ucr_wafer_classification_dataset(cache_dir: Union[str, Path] = DEFAULT_CACHE_DIR_ROOT,
 											seed: int = 42,
-											bsz: int = 128) -> ReturnType:
-	return create_ucr_classification_dataset("Wafer", cache_dir=cache_dir, seed=seed, bsz=bsz)
+											bsz: int = 128,
+											split_mode: str = "standard") -> ReturnType:
+	return create_ucr_classification_dataset("Wafer", cache_dir=cache_dir, seed=seed, bsz=bsz, split_mode=split_mode)
 
 
 Datasets = {

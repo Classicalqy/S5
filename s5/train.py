@@ -95,6 +95,12 @@ def train(args):
                             num_train=args.synthetic_num_train,
                             num_val=args.synthetic_num_val,
                             num_test=args.synthetic_num_test)
+    elif args.dataset.startswith("ucr-"):
+        trainloader, valloader, testloader, aux_dataloaders, n_classes, seq_len, in_dim, train_size = \
+          create_dataset_fn(args.dir_name,
+                            seed=args.jax_seed,
+                            bsz=args.bsz,
+                            split_mode=args.ucr_split_mode)
     else:
         trainloader, valloader, testloader, aux_dataloaders, n_classes, seq_len, in_dim, train_size = \
           create_dataset_fn(args.dir_name, seed=args.jax_seed, bsz=args.bsz)

@@ -38,6 +38,8 @@ if __name__ == "__main__":
 	parser.add_argument("--dataset", type=str, choices=Datasets.keys(),
 						default='mnist-classification',
 						help="dataset name")
+	parser.add_argument("--ucr_split_mode", type=str, default="standard", choices=["standard", "combined"],
+						help="UCR split mode: standard uses TRAIN with a validation split and TEST as test; combined merges TRAIN/TEST and uses an 80/10/10 split.")
 
 	# Model Parameters
 	parser.add_argument("--n_layers", type=int, default=6,
