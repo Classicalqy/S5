@@ -66,7 +66,7 @@ if __name__ == "__main__":
 							 " pool: mean pooling \\" \
 							 "last: take last element")
 	parser.add_argument("--activation_fn", default="half_glu1", type=str,
-						choices=["full_glu", "half_glu1", "half_glu2", "gelu"])
+						choices=["full_glu", "half_glu1", "half_glu2", "gelu", "relu"])
 	parser.add_argument("--conj_sym", type=str2bool, default=True,
 						help="whether to enforce conjugate symmetry")
 	parser.add_argument("--clip_eigs", type=str2bool, default=False,
@@ -91,6 +91,8 @@ if __name__ == "__main__":
 						help="True: use prenorm, False: use postnorm")
 	parser.add_argument("--batchnorm", type=str2bool, default=True,
 						help="True: use batchnorm, False: use layernorm")
+	parser.add_argument("--layernorm", type=str2bool, default=True,
+						help="Use layernorm when batchnorm is disabled")
 	parser.add_argument("--bn_momentum", type=float, default=0.95,
 						help="batchnorm momentum")
 	parser.add_argument("--bsz", type=int, default=64,

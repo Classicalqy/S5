@@ -165,6 +165,7 @@ def train(args):
             dropout=args.p_dropout,
             prenorm=args.prenorm,
             batchnorm=args.batchnorm,
+            layernorm=args.layernorm,
             bn_momentum=args.bn_momentum,
         )
 
@@ -181,6 +182,7 @@ def train(args):
             mode=args.mode,
             prenorm=args.prenorm,
             batchnorm=args.batchnorm,
+            layernorm=args.layernorm,
             bn_momentum=args.bn_momentum,
         )
 

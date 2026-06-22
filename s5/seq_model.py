@@ -16,6 +16,7 @@ class StackedEncoderModel(nn.Module):
             training    (bool):     whether in training mode or not
             prenorm     (bool):     apply prenorm if true or postnorm if false
             batchnorm   (bool):     apply batchnorm if true or layernorm if false
+            layernorm   (bool):     apply layernorm when batchnorm is false
             bn_momentum (float32):  the batchnorm momentum if batchnorm is used
             step_rescale  (float32):  allows for uniformly changing the timescale parameter,
                                     e.g. after training on a different resolution for
@@ -29,6 +30,7 @@ class StackedEncoderModel(nn.Module):
     training: bool = True
     prenorm: bool = False
     batchnorm: bool = False
+    layernorm: bool = True
     bn_momentum: float = 0.9
     step_rescale: float = 1.0
 
@@ -46,6 +48,7 @@ class StackedEncoderModel(nn.Module):
                 training=self.training,
                 prenorm=self.prenorm,
                 batchnorm=self.batchnorm,
+                layernorm=self.layernorm,
                 bn_momentum=self.bn_momentum,
                 step_rescale=self.step_rescale,
             )
@@ -105,6 +108,7 @@ class ClassificationModel(nn.Module):
                                                                        the last state]
             prenorm     (bool):     apply prenorm if true or postnorm if false
             batchnorm   (bool):     apply batchnorm if true or layernorm if false
+            layernorm   (bool):     apply layernorm when batchnorm is false
             bn_momentum (float32):  the batchnorm momentum if batchnorm is used
             step_rescale  (float32):  allows for uniformly changing the timescale parameter,
                                     e.g. after training on a different resolution for
@@ -121,6 +125,7 @@ class ClassificationModel(nn.Module):
     mode: str = "pool"
     prenorm: bool = False
     batchnorm: bool = False
+    layernorm: bool = True
     bn_momentum: float = 0.9
     step_rescale: float = 1.0
 
@@ -137,6 +142,7 @@ class ClassificationModel(nn.Module):
                             training=self.training,
                             prenorm=self.prenorm,
                             batchnorm=self.batchnorm,
+                            layernorm=self.layernorm,
                             bn_momentum=self.bn_momentum,
                             step_rescale=self.step_rescale,
                                         )
@@ -239,6 +245,7 @@ class RetrievalModel(nn.Module):
             training    (bool):     whether in training mode or not
             prenorm     (bool):     apply prenorm if true or postnorm if false
             batchnorm   (bool):     apply batchnorm if true or layernorm if false
+            layernorm   (bool):     apply layernorm when batchnorm is false
             bn_momentum (float32):  the batchnorm momentum if batchnorm is used
     """
     ssm: nn.Module
@@ -251,6 +258,7 @@ class RetrievalModel(nn.Module):
     training: bool = True
     prenorm: bool = False
     batchnorm: bool = False
+    layernorm: bool = True
     bn_momentum: float = 0.9
     step_rescale: float = 1.0
 
@@ -277,6 +285,7 @@ class RetrievalModel(nn.Module):
                             training=self.training,
                             prenorm=self.prenorm,
                             batchnorm=self.batchnorm,
+                            layernorm=self.layernorm,
                             bn_momentum=self.bn_momentum,
                             step_rescale=self.step_rescale,
                                         )

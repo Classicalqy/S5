@@ -21,7 +21,9 @@ for seed in 0 1 2 3 4; do
       d_model=8 \
       ssm_size_base=16 \
       blocks=1 \
+      activation_fn=relu \
       batchnorm=False \
+      layernorm=False \
       p_dropout=0.1 \
       bsz=64 \
       epochs=20 \

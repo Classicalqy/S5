@@ -14,6 +14,7 @@ class SequenceLayer(nn.Module):
             training    (bool):     whether in training mode or not
             prenorm     (bool):     apply prenorm if true or postnorm if false
             batchnorm   (bool):     apply batchnorm if true or layernorm if false
+            layernorm   (bool):     apply layernorm when batchnorm is false
             bn_momentum (float32):  the batchnorm momentum if batchnorm is used
             step_rescale  (float32):  allows for uniformly changing the timescale parameter,
                                     e.g. after training on a different resolution for
@@ -26,6 +27,7 @@ class SequenceLayer(nn.Module):
     training: bool = True
     prenorm: bool = False
     batchnorm: bool = False
+    layernorm: bool = True
     bn_momentum: float = 0.90
     step_rescale: float = 1.0
 
@@ -43,8 +45,10 @@ class SequenceLayer(nn.Module):
         if self.batchnorm:
             self.norm = nn.BatchNorm(use_running_average=not self.training,
                                      momentum=self.bn_momentum, axis_name='batch')
-        else:
+        elif self.layernorm:
             self.norm = nn.LayerNorm()
+        else:
+            self.norm = None
 
         self.drop = nn.Dropout(
             self.dropout,
@@ -61,7 +65,7 @@ class SequenceLayer(nn.Module):
             output sequence (float32): (L, d_model)
         """
         skip = x
-        if self.prenorm:
+        if self.prenorm and self.norm is not None:
             x = self.norm(x)
         x = self.seq(x)
 
@@ -80,11 +84,13 @@ class SequenceLayer(nn.Module):
             x = self.drop(x)
         elif self.activation in ["gelu"]:
             x = self.drop(nn.gelu(x))
+        elif self.activation in ["relu"]:
+            x = self.drop(nn.relu(x))
         else:
             raise NotImplementedError(
                    "Activation: {} not implemented".format(self.activation))
 
         x = skip + x
-        if not self.prenorm:
+        if not self.prenorm and self.norm is not None:
             x = self.norm(x)
         return x
