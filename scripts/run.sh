@@ -24,7 +24,7 @@ for seed in 0 1 2 3 4; do
       activation_fn=relu \
       batchnorm=False \
       layernorm=False \
-      p_dropout=0.1 \
+      p_dropout=0.0 \
       bsz=64 \
       epochs=20 \
       seed=$seed

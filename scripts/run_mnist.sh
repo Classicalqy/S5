@@ -19,10 +19,12 @@ for seed in 0 1 2 3 4; do
       model.ssm_param=$p \
       n_layers=2 \
       d_model=16 \
-      ssm_size_base=32 \
+      ssm_size_base=64 \
       blocks=1 \
       batchnorm=False \
-      p_dropout=0.1 \
+      activation_fn=relu \
+      layernorm=False \
+      p_dropout=0.0 \
       bsz=64 \
       epochs=20 \
       seed=$seed
