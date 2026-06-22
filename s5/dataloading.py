@@ -1,5 +1,6 @@
 import torch
 from pathlib import Path
+import numpy as np
 import os
 from typing import Callable, Optional, TypeVar, Dict, Tuple, List, Union
 
@@ -464,12 +465,118 @@ def create_synthetic_frequency_classification_dataset(cache_dir: Union[str, Path
 	return trainloader, valloader, testloader, aux_loaders, 2, seq_len, 1, num_train
 
 
+def _resolve_ucr_split_file(data_dir: Union[str, Path],
+							dataset_name: str,
+							split: str) -> Path:
+	root = Path(data_dir)
+	split = split.upper()
+	candidates = [
+		root / dataset_name / f"{dataset_name}_{split}.tsv",
+		root / dataset_name / f"{dataset_name}_{split}.TSV",
+		root / f"{dataset_name}_{split}.tsv",
+		root / f"{dataset_name}_{split}.TSV",
+	]
+	for path in candidates:
+		if path.exists():
+			return path
+
+	for pattern in (f"{dataset_name}_{split}.tsv", f"{dataset_name}_{split}.TSV"):
+		matches = sorted(root.rglob(pattern)) if root.exists() else []
+		if matches:
+			return matches[0]
+
+	raise FileNotFoundError(
+		f"Could not find UCR {dataset_name} {split} split under {root}. "
+		f"Expected e.g. {root / dataset_name / f'{dataset_name}_{split}.tsv'}"
+	)
+
+
+def _load_ucr_tsv(path: Path,
+				  label_to_index: Optional[Dict[float, int]] = None):
+	data = np.loadtxt(path, delimiter="\t", dtype=np.float32)
+	if data.ndim == 1:
+		data = data[None, :]
+	if data.shape[1] < 2:
+		raise ValueError(f"UCR TSV file {path} must contain a label column and at least one feature column.")
+
+	raw_labels = data[:, 0]
+	if label_to_index is None:
+		labels = sorted(float(label) for label in np.unique(raw_labels))
+		label_to_index = {label: idx for idx, label in enumerate(labels)}
+
+	unknown_labels = sorted(set(float(label) for label in np.unique(raw_labels)) - set(label_to_index))
+	if unknown_labels:
+		raise ValueError(f"UCR TSV file {path} contains labels not present in TRAIN split: {unknown_labels}")
+
+	mapped_labels = np.array([label_to_index[float(label)] for label in raw_labels], dtype=np.int64)
+	x = torch.from_numpy(data[:, 1:]).float().unsqueeze(-1)
+	y = torch.from_numpy(mapped_labels).long()
+	return torch.utils.data.TensorDataset(x, y), label_to_index
+
+
+def create_ucr_classification_dataset(dataset_name: str,
+									  cache_dir: Union[str, Path] = DEFAULT_CACHE_DIR_ROOT,
+									  seed: int = 42,
+									  bsz: int = 128,
+									  val_split: float = 0.1) -> ReturnType:
+	print(f"[*] Generating UCR-{dataset_name} Classification Dataset")
+
+	train_path = _resolve_ucr_split_file(cache_dir, dataset_name, "TRAIN")
+	test_path = _resolve_ucr_split_file(cache_dir, dataset_name, "TEST")
+	full_trainset, label_to_index = _load_ucr_tsv(train_path)
+	testset, _ = _load_ucr_tsv(test_path, label_to_index)
+
+	if not 0.0 < val_split < 1.0:
+		raise ValueError(f"val_split must be between 0 and 1, got {val_split}")
+
+	val_size = max(1, int(len(full_trainset) * val_split))
+	train_size = len(full_trainset) - val_size
+	if train_size < 1:
+		raise ValueError(f"UCR {dataset_name} TRAIN split is too small for val_split={val_split}")
+
+	trainset, valset = torch.utils.data.random_split(
+		full_trainset,
+		(train_size, val_size),
+		generator=torch.Generator().manual_seed(seed),
+	)
+
+	trainloader = make_data_loader(trainset, None, seed=seed, batch_size=bsz)
+	valloader = make_data_loader(valset, None, seed=seed, batch_size=bsz, drop_last=False, shuffle=False)
+	testloader = make_data_loader(testset, None, seed=seed, batch_size=bsz, drop_last=False, shuffle=False)
+
+	seq_len = full_trainset.tensors[0].shape[1]
+	n_classes = len(label_to_index)
+	aux_loaders = {}
+	return trainloader, valloader, testloader, aux_loaders, n_classes, seq_len, 1, train_size
+
+
+def create_ucr_ecg5000_classification_dataset(cache_dir: Union[str, Path] = DEFAULT_CACHE_DIR_ROOT,
+											  seed: int = 42,
+											  bsz: int = 128) -> ReturnType:
+	return create_ucr_classification_dataset("ECG5000", cache_dir=cache_dir, seed=seed, bsz=bsz)
+
+
+def create_ucr_forda_classification_dataset(cache_dir: Union[str, Path] = DEFAULT_CACHE_DIR_ROOT,
+											seed: int = 42,
+											bsz: int = 128) -> ReturnType:
+	return create_ucr_classification_dataset("FordA", cache_dir=cache_dir, seed=seed, bsz=bsz)
+
+
+def create_ucr_wafer_classification_dataset(cache_dir: Union[str, Path] = DEFAULT_CACHE_DIR_ROOT,
+											seed: int = 42,
+											bsz: int = 128) -> ReturnType:
+	return create_ucr_classification_dataset("Wafer", cache_dir=cache_dir, seed=seed, bsz=bsz)
+
+
 Datasets = {
 	# Other loaders.
 	"mnist-classification": create_mnist_classification_dataset,
 	"pmnist-classification": create_pmnist_classification_dataset,
 	"cifar-classification": create_cifar_classification_dataset,
 	"synthetic_frequency-classification": create_synthetic_frequency_classification_dataset,
+	"ucr-ecg5000-classification": create_ucr_ecg5000_classification_dataset,
+	"ucr-forda-classification": create_ucr_forda_classification_dataset,
+	"ucr-wafer-classification": create_ucr_wafer_classification_dataset,
 
 	# LRA.
 	"imdb-classification": create_lra_imdb_classification_dataset,
