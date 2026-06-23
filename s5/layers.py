@@ -19,6 +19,7 @@ class SequenceLayer(nn.Module):
             step_rescale  (float32):  allows for uniformly changing the timescale parameter,
                                     e.g. after training on a different resolution for
                                     the speech commands benchmark
+            use_residual (bool):  whether to add the layer input as a residual connection
     """
     ssm: nn.Module
     dropout: float
@@ -30,6 +31,7 @@ class SequenceLayer(nn.Module):
     layernorm: bool = True
     bn_momentum: float = 0.90
     step_rescale: float = 1.0
+    use_residual: bool = True
 
     def setup(self):
         """Initializes the ssm, batch/layer norm and dropout
@@ -90,7 +92,8 @@ class SequenceLayer(nn.Module):
             raise NotImplementedError(
                    "Activation: {} not implemented".format(self.activation))
 
-        x = skip + x
+        if self.use_residual:
+            x = skip + x
         if not self.prenorm and self.norm is not None:
             x = self.norm(x)
         return x

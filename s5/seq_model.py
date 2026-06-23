@@ -21,6 +21,7 @@ class StackedEncoderModel(nn.Module):
             step_rescale  (float32):  allows for uniformly changing the timescale parameter,
                                     e.g. after training on a different resolution for
                                     the speech commands benchmark
+            use_residual (bool):  whether S5 layers use residual connections
     """
     ssm: nn.Module
     d_model: int
@@ -33,6 +34,7 @@ class StackedEncoderModel(nn.Module):
     layernorm: bool = True
     bn_momentum: float = 0.9
     step_rescale: float = 1.0
+    use_residual: bool = True
 
     def setup(self):
         """
@@ -51,6 +53,7 @@ class StackedEncoderModel(nn.Module):
                 layernorm=self.layernorm,
                 bn_momentum=self.bn_momentum,
                 step_rescale=self.step_rescale,
+                use_residual=self.use_residual,
             )
             for _ in range(self.n_layers)
         ]
@@ -113,6 +116,7 @@ class ClassificationModel(nn.Module):
             step_rescale  (float32):  allows for uniformly changing the timescale parameter,
                                     e.g. after training on a different resolution for
                                     the speech commands benchmark
+            use_residual (bool):  whether S5 layers use residual connections
     """
     ssm: nn.Module
     d_output: int
@@ -128,6 +132,7 @@ class ClassificationModel(nn.Module):
     layernorm: bool = True
     bn_momentum: float = 0.9
     step_rescale: float = 1.0
+    use_residual: bool = True
 
     def setup(self):
         """
@@ -145,6 +150,7 @@ class ClassificationModel(nn.Module):
                             layernorm=self.layernorm,
                             bn_momentum=self.bn_momentum,
                             step_rescale=self.step_rescale,
+                            use_residual=self.use_residual,
                                         )
         self.decoder = nn.Dense(self.d_output)
 
@@ -247,6 +253,7 @@ class RetrievalModel(nn.Module):
             batchnorm   (bool):     apply batchnorm if true or layernorm if false
             layernorm   (bool):     apply layernorm when batchnorm is false
             bn_momentum (float32):  the batchnorm momentum if batchnorm is used
+            use_residual (bool):  whether S5 layers use residual connections
     """
     ssm: nn.Module
     d_output: int
@@ -261,6 +268,7 @@ class RetrievalModel(nn.Module):
     layernorm: bool = True
     bn_momentum: float = 0.9
     step_rescale: float = 1.0
+    use_residual: bool = True
 
     def setup(self):
         """
@@ -288,6 +296,7 @@ class RetrievalModel(nn.Module):
                             layernorm=self.layernorm,
                             bn_momentum=self.bn_momentum,
                             step_rescale=self.step_rescale,
+                            use_residual=self.use_residual,
                                         )
         BatchRetrievalDecoder = nn.vmap(
             RetrievalDecoder,

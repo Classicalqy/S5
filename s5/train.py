@@ -173,6 +173,7 @@ def train(args):
             batchnorm=args.batchnorm,
             layernorm=args.layernorm,
             bn_momentum=args.bn_momentum,
+            use_residual=args.use_residual,
         )
 
     else:
@@ -190,6 +191,7 @@ def train(args):
             batchnorm=args.batchnorm,
             layernorm=args.layernorm,
             bn_momentum=args.bn_momentum,
+            use_residual=args.use_residual,
         )
 
     # initialize training state

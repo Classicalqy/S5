@@ -67,6 +67,8 @@ if __name__ == "__main__":
 						help="options: (for classification tasks) \\" \
 							 " pool: mean pooling \\" \
 							 "last: take last element")
+	parser.add_argument("--use_residual", type=str2bool, default=True,
+						help="Use residual skip connections inside each S5 layer.")
 	parser.add_argument("--activation_fn", default="half_glu1", type=str,
 						choices=["full_glu", "half_glu1", "half_glu2", "gelu", "relu"])
 	parser.add_argument("--conj_sym", type=str2bool, default=True,

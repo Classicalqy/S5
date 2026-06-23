@@ -21,6 +21,8 @@ for seed in 0 1 2 3 4; do
       d_model=16 \
       ssm_size_base=64 \
       blocks=1 \
+      mode=last \
+      use_residual=False \
       batchnorm=False \
       activation_fn=relu \
       layernorm=False \
