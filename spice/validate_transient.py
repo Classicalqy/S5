@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+from scipy.integrate import solve_ivp
 
 from .export_netlist import (
     _input_node,
@@ -55,6 +56,7 @@ def make_stimulus(times, input_dim, kind="sine", amplitude=0.1):
         freq = base_hz * (idx + 1)
         phase = idx * np.pi / max(input_dim, 1)
         inputs[:, idx] = amplitude * np.sin(2.0 * np.pi * freq * times + phase)
+    inputs[0, :] = 0.0
     return inputs
 
 
@@ -66,27 +68,33 @@ def interpolate_inputs(times, inputs, t):
 
 
 def simulate_layer_reference(layer, times, inputs):
+    times = np.asarray(times, dtype=np.float64)
     A = layer_state_matrix(layer)
     B = layer_input_matrix(layer)
     x = np.zeros((A.shape[0],), dtype=np.float64)
     states = np.zeros((times.shape[0], A.shape[0]), dtype=np.float64)
-    outputs = np.zeros((times.shape[0], layer.output_dim), dtype=np.float64)
 
     def rhs(t, state):
         return A @ state + B @ interpolate_inputs(times, inputs, t)
 
-    states[0] = x
-    outputs[0] = layer.C @ x
-    for i in range(1, times.shape[0]):
-        t0 = times[i - 1]
-        dt = times[i] - t0
-        k1 = rhs(t0, x)
-        k2 = rhs(t0 + 0.5 * dt, x + 0.5 * dt * k1)
-        k3 = rhs(t0 + 0.5 * dt, x + 0.5 * dt * k2)
-        k4 = rhs(t0 + dt, x + dt * k3)
-        x = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-        states[i] = x
-        outputs[i] = layer.C @ x
+    if times.shape[0] > 1:
+        positive_steps = np.diff(times)
+        if np.any(positive_steps <= 0):
+            raise ValueError("times must be strictly increasing.")
+        solution = solve_ivp(
+            rhs,
+            (float(times[0]), float(times[-1])),
+            x,
+            t_eval=times,
+            rtol=1e-9,
+            atol=1e-11,
+            max_step=float(np.min(positive_steps) / 10.0),
+        )
+        if not solution.success:
+            raise RuntimeError(f"Python reference integration failed: {solution.message}")
+        states = solution.y.T
+
+    outputs = states @ layer.C.T
     return states, outputs
 
 
@@ -141,7 +149,8 @@ def write_validation_deck(
     base = Path(base_cir_path).read_text()
     body = strip_final_end(base)
     duration = float(times[-1])
-    max_step = duration / max(len(times) - 1, 1)
+    output_step = duration / max(len(times) - 1, 1)
+    max_step = output_step / 10.0
     save_nodes = []
     save_nodes.extend(_input_node(layer_index, idx) for idx in range(layer.input_dim))
     save_nodes.extend(
@@ -230,7 +239,7 @@ def generate_validation_artifacts(
         "stimulus": stimulus,
         "amplitude": float(amplitude),
         "saved_nodes": save_nodes,
-        "ltspice_app": "/Applications/LTspice.app/Contents/MacOS/LTspice",
+        "ltspice_app": "/Applications/LTspice.app/Contents/SharedSupport/ltspice/LTspice/run_ltspice",
     }
     metadata_path = out_dir / f"{stem}_layer{layer_index}_validation.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))

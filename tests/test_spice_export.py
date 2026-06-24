@@ -3,6 +3,7 @@ import math
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from flax.serialization import to_bytes
 
 from s5.train import save_params_msgpack
@@ -15,7 +16,7 @@ from spice.export_netlist import (
     positive,
 )
 from spice.compare_transient import compare_traces
-from spice.validate_transient import generate_validation_artifacts, simulate_layer_reference
+from spice.validate_transient import generate_validation_artifacts, make_stimulus, simulate_layer_reference
 
 
 def _single_ssm_params(ssm_param="resonant_2x2", H=2, P=4):
@@ -182,6 +183,14 @@ def test_python_reference_has_expected_shapes():
     np.testing.assert_allclose(outputs[0], 0.0)
 
 
+def test_sine_stimulus_starts_at_zero_for_ltspice_uic():
+    times = np.linspace(0.0, 0.01, 11)
+
+    inputs = make_stimulus(times, input_dim=4, kind="sine", amplitude=0.1)
+
+    np.testing.assert_allclose(inputs[0], 0.0)
+
+
 def test_validation_artifacts_are_generated(tmp_path):
     params = _nested_params(_single_ssm_params())
     params_path = save_params_msgpack(params, tmp_path / "params.msgpack")
@@ -219,3 +228,13 @@ def test_compare_traces_accepts_ltspice_style_columns(tmp_path):
 
     assert set(results) == {"l0_out0"}
     np.testing.assert_allclose(results["l0_out0"]["max_abs"], 0.1)
+
+
+def test_compare_traces_rejects_missing_requested_nodes(tmp_path):
+    reference = tmp_path / "reference.csv"
+    reference.write_text("time,L0_out0\n0,0\n1e-3,1\n")
+    ltspice = tmp_path / "ltspice.txt"
+    ltspice.write_text("time\tV(L0_out0)\n0\t0\n1e-3\t1\n")
+
+    with pytest.raises(ValueError, match="missing"):
+        compare_traces(reference, ltspice, nodes=["L0_out1"])

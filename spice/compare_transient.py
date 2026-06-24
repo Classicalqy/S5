@@ -115,6 +115,13 @@ def compare_traces(reference_csv, ltspice_export, nodes=None):
         nodes = sorted(set(reference.keys()) & set(ltspice.keys()) - {"time"})
     else:
         nodes = [canonical_column(node) for node in nodes]
+        missing = [
+            node
+            for node in nodes
+            if node not in reference or node not in ltspice
+        ]
+        if missing:
+            raise ValueError("Requested trace columns are missing: " + ", ".join(missing))
     if not nodes:
         raise ValueError("No common trace columns found.")
 
@@ -122,8 +129,6 @@ def compare_traces(reference_csv, ltspice_export, nodes=None):
     spice_time = ltspice["time"]
     results = {}
     for node in nodes:
-        if node not in reference or node not in ltspice:
-            continue
         spice_interp = np.interp(ref_time, spice_time, ltspice[node])
         diff = spice_interp - reference[node]
         results[node] = {
