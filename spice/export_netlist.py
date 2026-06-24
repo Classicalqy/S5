@@ -441,28 +441,51 @@ def emit_output_stage(builder, layer, layer_idx):
             ]
         )
 
-        resistors, metadata = sign_aware_resistors(weights, state_nodes, layer_idx, output_idx, "C")
-        for item_idx, item in enumerate(resistors):
-            name = f"R_L{layer_idx}_O{output_idx}_C{item_idx}"
-            builder.component(name, f"{name} {item['source']} {sum_node} {format_spice_value(item['resistance'])}")
+        nonzero_components = []
+        for state_index, weight in nonzero:
+            source = state_nodes[state_index]
+            polarity = "direct"
+            if weight > 0:
+                inverted = f"{source}_inv_O{output_idx}"
+                inv_name = f"XINV_L{layer_idx}_O{output_idx}_C{state_index}"
+                builder.component(inv_name, f"{inv_name} {source} {inverted} unity_inverter")
+                components.append(
+                    _component_record(
+                        inv_name,
+                        "subckt",
+                        [source, inverted],
+                        role="unity_inverter",
+                    )
+                )
+                source = inverted
+                polarity = "inverted"
+            resistance = DEFAULT_FEEDBACK_RESISTANCE / abs(weight)
+            name = f"R_L{layer_idx}_O{output_idx}_C{state_index}"
+            builder.component(name, f"{name} {source} {sum_node} {format_spice_value(resistance)}")
             components.append(
                 _component_record(
                     name,
                     "resistor",
-                    [item["source"], sum_node],
-                    item["resistance"],
+                    [source, sum_node],
+                    resistance,
                     role="output_weight",
-                    coefficient=float(item["coefficient"]),
-                    source_index=item["source_index"],
-                    sign=item["sign"],
+                    coefficient=float(weight),
+                    source_index=state_index,
+                    sign="positive" if weight > 0 else "negative",
+                    polarity=polarity,
                 )
             )
+            nonzero_components.append(name)
         output_records.append(
             {
                 "output_index": output_idx,
                 "node": out_node,
                 "nonzero_weights": len(nonzero),
-                "adder_metadata": metadata,
+                "adder_metadata": {
+                    "feedback_resistance": float(DEFAULT_FEEDBACK_RESISTANCE),
+                    "implementation": "inverting_summer_with_unity_inverters_for_positive_weights",
+                    "components": nonzero_components,
+                },
             }
         )
     builder.line()

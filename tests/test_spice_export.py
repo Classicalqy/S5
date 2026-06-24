@@ -14,6 +14,8 @@ from spice.export_netlist import (
     module_to_layer,
     positive,
 )
+from spice.compare_transient import compare_traces
+from spice.validate_transient import generate_validation_artifacts, simulate_layer_reference
 
 
 def _single_ssm_params(ssm_param="resonant_2x2", H=2, P=4):
@@ -164,3 +166,56 @@ def test_train_save_params_msgpack_matches_exporter_format(tmp_path):
 
     modules = find_ssm_modules(loaded)
     assert len(modules) == 1
+
+
+def test_python_reference_has_expected_shapes():
+    params = _nested_params(_single_ssm_params())
+    layer = module_to_layer("seq", find_ssm_modules(params)[0][1], "resonant_2x2", sample_rate=10.0)
+    times = np.linspace(0.0, 0.01, 11)
+    inputs = np.ones((11, layer.input_dim)) * 0.1
+
+    states, outputs = simulate_layer_reference(layer, times, inputs)
+
+    assert states.shape == (11, 2 * layer.n_blocks)
+    assert outputs.shape == (11, layer.output_dim)
+    np.testing.assert_allclose(states[0], 0.0)
+    np.testing.assert_allclose(outputs[0], 0.0)
+
+
+def test_validation_artifacts_are_generated(tmp_path):
+    params = _nested_params(_single_ssm_params())
+    params_path = save_params_msgpack(params, tmp_path / "params.msgpack")
+    cir_path = tmp_path / "model.cir"
+    netlist, _ = build_netlist(params, "resonant_2x2", sample_rate=10.0)
+    cir_path.write_text(netlist)
+
+    metadata = generate_validation_artifacts(
+        params_path=params_path,
+        cir_path=cir_path,
+        ssm_param="resonant_2x2",
+        sample_rate=10.0,
+        out_dir=tmp_path / "validation",
+        duration=0.01,
+        points=11,
+        amplitude=0.1,
+    )
+
+    validation_cir = tmp_path / "validation" / "model_layer0_validation.cir"
+    reference_csv = tmp_path / "validation" / "model_layer0_reference.csv"
+    assert validation_cir.exists()
+    assert reference_csv.exists()
+    assert ".tran" in validation_cir.read_text()
+    assert "PWL(" in validation_cir.read_text()
+    assert metadata["saved_nodes"]
+
+
+def test_compare_traces_accepts_ltspice_style_columns(tmp_path):
+    reference = tmp_path / "reference.csv"
+    reference.write_text("time,L0_out0\n0,0\n1e-3,1\n2e-3,2\n")
+    ltspice = tmp_path / "ltspice.txt"
+    ltspice.write_text("time\tV(L0_out0)\n0\t0\n1e-3\t1.1\n2e-3\t1.9\n")
+
+    results = compare_traces(reference, ltspice)
+
+    assert set(results) == {"l0_out0"}
+    np.testing.assert_allclose(results["l0_out0"]["max_abs"], 0.1)
