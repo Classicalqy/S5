@@ -219,9 +219,12 @@ def _component_record(name, kind, nodes, value=None, role=None, **extra):
     return record
 
 
-def add_model_header(builder, state_capacitance):
+def add_model_header(builder, state_capacitance, dense_included=False):
     builder.line("* LTSpice netlist generated from hardware-friendly S5 SSM layers")
-    builder.line("* Dense encoder/decoder, normalization, residual, and activation layers are not included.")
+    if dense_included:
+        builder.line("* Dense encoder/decoder are included; normalization, residual, and non-ReLU activations are not included.")
+    else:
+        builder.line("* Dense encoder/decoder, normalization, residual, and activation layers are not included.")
     builder.line(".subckt ideal_opamp noninv inv out")
     builder.line("Eop out 0 noninv inv 1e6")
     builder.line(".ends ideal_opamp")

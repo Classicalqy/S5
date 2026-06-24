@@ -16,6 +16,13 @@ from spice.export_netlist import (
     positive,
 )
 from spice.compare_transient import compare_traces
+from spice.export_full_model import (
+    build_full_netlist,
+    emit_linear_stage,
+    extract_full_model,
+)
+from spice.export_netlist import NetlistBuilder
+from spice.validate_full_model import generate_full_validation_artifacts, simulate_full_reference
 from spice.validate_transient import generate_validation_artifacts, make_stimulus, simulate_layer_reference
 
 
@@ -42,6 +49,23 @@ def _nested_params(module):
                 "kernel": np.ones((2, 2)),
             },
         }
+    }
+
+
+def _full_model_params():
+    return {
+        "encoder": {
+            "encoder": {
+                "kernel": np.array([[0.5, -0.25]], dtype=np.float32),
+                "bias": np.array([0.1, -0.2], dtype=np.float32),
+            },
+            "layers_0": {"seq": _single_ssm_params(H=2, P=4)},
+            "layers_1": {"seq": _single_ssm_params(H=2, P=4)},
+        },
+        "decoder": {
+            "kernel": np.array([[0.2, -0.3, 0.1], [-0.4, 0.5, -0.6]], dtype=np.float32),
+            "bias": np.array([0.01, -0.02, 0.03], dtype=np.float32),
+        },
     }
 
 
@@ -238,3 +262,87 @@ def test_compare_traces_rejects_missing_requested_nodes(tmp_path):
 
     with pytest.raises(ValueError, match="missing"):
         compare_traces(reference, ltspice, nodes=["L0_out1"])
+
+
+def test_compare_traces_can_focus_final_sample(tmp_path):
+    reference = tmp_path / "reference.csv"
+    reference.write_text("time,L0_out0\n0,0\n1e-3,1\n2e-3,2\n")
+    ltspice = tmp_path / "ltspice.txt"
+    ltspice.write_text("time\tV(L0_out0)\n0\t100\n1e-3\t1.1\n2e-3\t2.01\n")
+
+    results = compare_traces(reference, ltspice, nodes=["L0_out0"], final_only=True)
+
+    np.testing.assert_allclose(results["l0_out0"]["max_abs"], 0.01)
+
+
+def test_linear_stage_signs_and_bias_are_explicit():
+    builder = NetlistBuilder()
+
+    outputs, _ = emit_linear_stage(
+        builder,
+        "TEST",
+        ["SRC0", "SRC1"],
+        np.array([[2.0, -3.0], [-4.0, 0.0]]),
+        np.array([0.5, -0.25]),
+        "OUT",
+    )
+    netlist = builder.render()
+
+    assert outputs == ["OUT0", "OUT1"]
+    assert "XINV_TEST_0_0 SRC0 SRC0_inv_TEST_0 unity_inverter" in netlist
+    assert "R_TEST_1_0 SRC0 OUT1_sum" in netlist
+    assert "V_TEST_BIAS_0 OUT0_bias 0 -0.5" in netlist
+    assert "V_TEST_BIAS_1 OUT1_bias 0 0.25" in netlist
+
+
+def test_full_model_exporter_rejects_missing_decoder():
+    params = _full_model_params()
+    del params["decoder"]
+
+    with pytest.raises(ValueError, match="decoder/kernel"):
+        build_full_netlist(params, "resonant_2x2", sample_rate=10.0)
+
+
+def test_full_model_exporter_only_accepts_encoder_seq_ssm_layers():
+    params = _full_model_params()
+    params["encoder"]["layers_0"]["not_seq"] = params["encoder"]["layers_0"].pop("seq")
+
+    with pytest.raises(ValueError, match="exactly 2 SSM layers"):
+        build_full_netlist(params, "resonant_2x2", sample_rate=10.0)
+
+
+def test_full_model_reference_returns_logit_traces():
+    model = extract_full_model(_full_model_params(), "resonant_2x2", sample_rate=10.0)
+    times = np.linspace(0.0, 0.01, 11)
+    inputs = make_stimulus(times, input_dim=1, kind="sine", amplitude=0.1)
+
+    traces = simulate_full_reference(model, times, inputs)
+
+    assert traces["LOGIT0"].shape == (11,)
+    assert traces["LOGIT2"].shape == (11,)
+    np.testing.assert_allclose(traces["LOGIT0"][0], model.decoder_bias[0])
+
+
+def test_full_model_validation_artifacts_are_generated(tmp_path):
+    params = _full_model_params()
+    params_path = save_params_msgpack(params, tmp_path / "params.msgpack")
+    cir_path = tmp_path / "full.cir"
+    netlist, _ = build_full_netlist(params, "resonant_2x2", sample_rate=10.0)
+    cir_path.write_text(netlist)
+
+    metadata = generate_full_validation_artifacts(
+        params_path=params_path,
+        cir_path=cir_path,
+        ssm_param="resonant_2x2",
+        sample_rate=10.0,
+        out_dir=tmp_path / "validation_full",
+        duration=0.01,
+        points=11,
+    )
+
+    deck = (tmp_path / "validation_full" / "full_validation.cir").read_text()
+    assert ".tran" in deck and "uic" in deck
+    assert "PWL(" in deck
+    assert "B_RELU0_0" in deck
+    assert "V(LOGIT0)" in deck
+    assert metadata["logit_nodes"] == ["LOGIT0", "LOGIT1", "LOGIT2"]

@@ -106,7 +106,7 @@ def read_ltspice_ascii_raw(lines):
     return {key: np.asarray(value, dtype=np.float64) for key, value in columns.items()}
 
 
-def compare_traces(reference_csv, ltspice_export, nodes=None):
+def compare_traces(reference_csv, ltspice_export, nodes=None, skip_initial_points=0, final_only=False):
     reference = read_trace_table(reference_csv)
     ltspice = read_trace_table(ltspice_export)
     if "time" not in reference or "time" not in ltspice:
@@ -131,6 +131,12 @@ def compare_traces(reference_csv, ltspice_export, nodes=None):
     for node in nodes:
         spice_interp = np.interp(ref_time, spice_time, ltspice[node])
         diff = spice_interp - reference[node]
+        if final_only:
+            diff = diff[-1:]
+        elif skip_initial_points:
+            diff = diff[int(skip_initial_points):]
+        if diff.size == 0:
+            raise ValueError("No samples remain after applying comparison filters.")
         results[node] = {
             "rmse": float(np.sqrt(np.mean(diff ** 2))),
             "max_abs": float(np.max(np.abs(diff))),
@@ -144,13 +150,21 @@ def parse_args(argv=None):
     parser.add_argument("--reference", required=True, help="Python reference CSV.")
     parser.add_argument("--ltspice", required=True, help="LTSpice exported text/CSV traces.")
     parser.add_argument("--nodes", nargs="*", default=None, help="Optional node names to compare.")
+    parser.add_argument("--skip-initial-points", type=int, default=0)
+    parser.add_argument("--final-only", action="store_true")
     parser.add_argument("--json-out", default=None, help="Optional JSON summary output.")
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
-    results = compare_traces(args.reference, args.ltspice, args.nodes)
+    results = compare_traces(
+        args.reference,
+        args.ltspice,
+        args.nodes,
+        skip_initial_points=args.skip_initial_points,
+        final_only=args.final_only,
+    )
     text = json.dumps(results, indent=2, sort_keys=True)
     print(text)
     if args.json_out:
