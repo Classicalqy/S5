@@ -25,6 +25,22 @@ from .export_netlist import (
     load_flax_params,
     module_to_layer,
 )
+from .trace_utils import linear_nodes
+
+
+FULL_MODEL_TOPOLOGY = "Dense encoder -> SSM0 -> ReLU -> SSM1 -> ReLU -> Dense decoder"
+FULL_MODEL_CIRCUIT_SEMANTICS = "continuous_cascade_without_inter_layer_sample_hold"
+FULL_MODEL_ASSUMPTIONS = (
+    "restricted MNIST model",
+    "exactly two RealValuedSSM layers",
+    "activation_fn=relu",
+    "mode=last",
+    "use_residual=False",
+    "batchnorm=False",
+    "layernorm=False",
+    "p_dropout=0.0",
+    "decoder logits only; softmax is not exported",
+)
 
 
 @dataclass(frozen=True)
@@ -81,10 +97,6 @@ def extract_full_model(params, ssm_param, sample_rate):
     return FullModel(encoder_kernel, encoder_bias, ssm_layers, decoder_kernel, decoder_bias)
 
 
-def _linear_nodes(prefix, count):
-    return [f"{prefix}{idx}" for idx in range(count)]
-
-
 def emit_linear_stage(builder, name, source_nodes, kernel, bias, output_prefix):
     """Emit y = source @ kernel + bias using inverting summers."""
     kernel = np.asarray(kernel, dtype=np.float64)
@@ -94,7 +106,7 @@ def emit_linear_stage(builder, name, source_nodes, kernel, bias, output_prefix):
     if kernel.shape[1] != bias.shape[0]:
         raise ValueError(f"{name}: kernel output dimension does not match bias.")
 
-    output_nodes = _linear_nodes(output_prefix, kernel.shape[1])
+    output_nodes = linear_nodes(output_prefix, kernel.shape[1])
     components = []
     for out_idx, out_node in enumerate(output_nodes):
         sum_node = f"{out_node}_sum"
@@ -136,7 +148,7 @@ def emit_linear_stage(builder, name, source_nodes, kernel, bias, output_prefix):
 
 
 def emit_relu_stage(builder, name, source_nodes, output_prefix):
-    output_nodes = _linear_nodes(output_prefix, len(source_nodes))
+    output_nodes = linear_nodes(output_prefix, len(source_nodes))
     for idx, (source, out_node) in enumerate(zip(source_nodes, output_nodes)):
         builder.component(f"B_{name}_{idx}", f"B_{name}_{idx} {out_node} 0 V=max(V({source}),0)")
     builder.line()
@@ -160,7 +172,9 @@ def build_full_netlist(params, ssm_param, sample_rate):
     model = extract_full_model(params, ssm_param, sample_rate)
     builder = NetlistBuilder()
     add_model_header(builder, state_capacitance=1e-6, dense_included=True)
-    builder.line("* Full restricted model: Dense encoder -> SSM/ReLU -> SSM/ReLU -> Dense decoder")
+    builder.line(f"* Full restricted model: {FULL_MODEL_TOPOLOGY}")
+    builder.line(f"* Circuit semantics: {FULL_MODEL_CIRCUIT_SEMANTICS}")
+    builder.line("* Note: stacked SSM layers are connected continuously, with no inter-layer sample-and-hold.")
 
     input_nodes = ["IN0"]
     encoder_nodes, encoder_components = emit_linear_stage(
@@ -178,6 +192,9 @@ def build_full_netlist(params, ssm_param, sample_rate):
     manifest = {
         "sample_rate": float(sample_rate),
         "ssm_param": ssm_param,
+        "topology": FULL_MODEL_TOPOLOGY,
+        "circuit_semantics": FULL_MODEL_CIRCUIT_SEMANTICS,
+        "assumptions": list(FULL_MODEL_ASSUMPTIONS),
         "input_nodes": input_nodes,
         "encoder_nodes": encoder_nodes,
         "ssm_output_nodes": [[_output_node(i, j) for j in range(layer.output_dim)] for i, layer in enumerate(model.ssm_layers)],

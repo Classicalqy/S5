@@ -1,5 +1,6 @@
 flax
 scipy
+einops
 torch
 torchtext
 tensorflow-datasets==4.5.2

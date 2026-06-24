@@ -1,9 +1,10 @@
 # LTSpice Export For Hardware-Friendly S5 Layers
 
 This package exports trained hardware-friendly S5 SSM layers to LTSpice netlists.
-The first version supports only `resonant_2x2` and `energy_shaped_2x2`
+The layer exporter supports only `resonant_2x2` and `energy_shaped_2x2`
 `RealValuedSSM` modules. Dense encoder/decoder layers, normalization,
-residual paths, dropout, GLU/GELU activations, and classifier heads are skipped.
+residual paths, dropout, GLU/GELU activations, and classifier heads are skipped
+by the layer-only exporter.
 
 ## Usage
 
@@ -77,3 +78,50 @@ Each layer output is emitted as a sign-aware add/sub stage derived from the
 paper's resistor rules. When needed, a grounded dummy negative branch is added
 so all generated resistor values remain positive.
 
+## Restricted Full MNIST Export
+
+`spice.export_full_model` adds a minimal full-model netlist for the current
+restricted MNIST checkpoint:
+
+```text
+Dense encoder -> SSM0 -> ReLU -> SSM1 -> ReLU -> Dense decoder logits
+```
+
+It assumes exactly two hardware-friendly SSM layers, `activation_fn=relu`,
+`mode=last`, no residual path, no batch/layer norm, no dropout, and decoder
+logits only. These assumptions are recorded in the generated component
+manifest, but they are not all recoverable from a Flax params-only checkpoint.
+Use a checkpoint trained with the matching config.
+
+The generated full circuit is a continuous analog cascade:
+
+```text
+circuit_semantics = continuous_cascade_without_inter_layer_sample_hold
+```
+
+That means `SSM0 -> ReLU -> SSM1` is wired directly in continuous time. This is
+not exactly the same semantics as the digital stacked SSM recurrence, where each
+layer consumes a sampled sequence. For exact digital stacked semantics in
+hardware, an inter-layer sample-and-hold stage is needed.
+
+## Validation Modes
+
+`spice.validate_digital_alignment` compares three references:
+
+- digital ZOH SSM recurrence used by training,
+- Python continuous cascade,
+- LTSpice transient sampled at the digital sample times, when `.raw` files are
+  present.
+
+Use it to diagnose whether an error is a circuit/export issue or a semantics
+difference between continuous cascades and sampled stacked recurrences.
+
+`spice.validate_ltspice_accuracy` is a logit-only MNIST accuracy runner for
+larger subsets. It saves only `V(LOGIT0)` through `V(LOGIT9)`, writes
+`per_sample.csv`, can resume completed samples, and can delete `.raw`/`.log`
+files after reading final logits.
+
+Its logit-difference fields are named `ltspice_vs_digital_*` intentionally:
+they compare the LTSpice continuous cascade final logits against the digital
+stacked recurrence final logits. Those differences therefore include both
+analog transient error and the expected model-semantics difference.

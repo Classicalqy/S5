@@ -7,7 +7,7 @@ import pytest
 from flax.serialization import to_bytes
 
 from s5.train import save_params_msgpack
-from s5.ssm_parameterizations import init_RealValuedSSM
+from s5.ssm_parameterizations import discretize_2x2_blocks, init_RealValuedSSM
 from spice.export_netlist import (
     build_netlist,
     find_ssm_modules,
@@ -22,7 +22,15 @@ from spice.export_full_model import (
     extract_full_model,
 )
 from spice.export_netlist import NetlistBuilder
+from spice.trace_utils import zoh_pwl_source_line
+from spice.validate_digital_alignment import (
+    generate_digital_alignment_artifacts,
+    layer_discrete_matrices,
+    simulate_full_continuous_zoh,
+    simulate_full_digital,
+)
 from spice.validate_full_model import generate_full_validation_artifacts, simulate_full_reference
+from spice.validate_ltspice_accuracy import validate_ltspice_accuracy, write_logit_only_deck
 from spice.validate_transient import generate_validation_artifacts, make_stimulus, simulate_layer_reference
 
 
@@ -215,6 +223,17 @@ def test_sine_stimulus_starts_at_zero_for_ltspice_uic():
     np.testing.assert_allclose(inputs[0], 0.0)
 
 
+def test_zoh_pwl_source_holds_previous_sample():
+    line = zoh_pwl_source_line("VIN", "IN0", 0.1, np.array([1.0, 2.0, -1.0]))
+
+    assert line.startswith("VIN IN0 0 PWL(")
+    assert "0 1" in line
+    assert "0.0999999 1" in line
+    assert "0.1 2" in line
+    assert "0.1999999 2" in line
+    assert "0.2 -1" in line
+
+
 def test_validation_artifacts_are_generated(tmp_path):
     params = _nested_params(_single_ssm_params())
     params_path = save_params_msgpack(params, tmp_path / "params.msgpack")
@@ -311,6 +330,14 @@ def test_full_model_exporter_only_accepts_encoder_seq_ssm_layers():
         build_full_netlist(params, "resonant_2x2", sample_rate=10.0)
 
 
+def test_full_model_manifest_records_continuous_cascade_semantics():
+    netlist, manifest = build_full_netlist(_full_model_params(), "resonant_2x2", sample_rate=10.0)
+
+    assert "continuous_cascade_without_inter_layer_sample_hold" in netlist
+    assert manifest["circuit_semantics"] == "continuous_cascade_without_inter_layer_sample_hold"
+    assert "activation_fn=relu" in manifest["assumptions"]
+
+
 def test_full_model_reference_returns_logit_traces():
     model = extract_full_model(_full_model_params(), "resonant_2x2", sample_rate=10.0)
     times = np.linspace(0.0, 0.01, 11)
@@ -321,6 +348,113 @@ def test_full_model_reference_returns_logit_traces():
     assert traces["LOGIT0"].shape == (11,)
     assert traces["LOGIT2"].shape == (11,)
     np.testing.assert_allclose(traces["LOGIT0"][0], model.decoder_bias[0])
+
+
+def test_digital_discrete_matrices_match_training_zoh_discretizer():
+    model = extract_full_model(_full_model_params(), "resonant_2x2", sample_rate=10.0)
+    layer = model.ssm_layers[0]
+
+    A_bar, B_bar = layer_discrete_matrices(layer)
+    expected_A, expected_B = discretize_2x2_blocks(
+        layer.q * layer.alpha,
+        layer.q * layer.omega,
+        layer.B.reshape((layer.n_blocks, 2, layer.input_dim)),
+        layer.delta,
+        "zoh",
+    )
+
+    np.testing.assert_allclose(A_bar, np.asarray(expected_A), rtol=1e-6)
+    np.testing.assert_allclose(B_bar, np.asarray(expected_B), rtol=1e-6)
+
+
+def test_full_model_digital_and_continuous_alignment_shapes():
+    model = extract_full_model(_full_model_params(), "resonant_2x2", sample_rate=10.0)
+    inputs = np.linspace(0.0, 0.2, 5, dtype=np.float64)[:, None]
+
+    digital = simulate_full_digital(model, inputs, sample_rate=10.0)
+    continuous = simulate_full_continuous_zoh(model, inputs, sample_rate=10.0)
+
+    assert digital["LOGIT0"].shape == (5,)
+    assert continuous["LOGIT0"].shape == (5,)
+    assert digital["L0_out0"].shape == (5,)
+    np.testing.assert_allclose(digital["time"], np.arange(1, 6) / 10.0)
+
+
+def test_digital_alignment_summary_is_pending_without_raw(tmp_path):
+    params = _full_model_params()
+    params_path = save_params_msgpack(params, tmp_path / "params.msgpack")
+    cir_path = tmp_path / "full.cir"
+    netlist, _ = build_full_netlist(params, "resonant_2x2", sample_rate=10.0)
+    cir_path.write_text(netlist)
+
+    summary = generate_digital_alignment_artifacts(
+        params_path=params_path,
+        cir_path=cir_path,
+        ssm_param="resonant_2x2",
+        sample_rate=10.0,
+        out_dir=tmp_path / "digital",
+        num_samples=2,
+        samples=np.zeros((2, 4, 1), dtype=np.float64),
+        labels=np.array([0, 1]),
+    )
+
+    assert summary["ltspice_status"] == "pending"
+    assert summary["ltspice_accuracy"] is None
+    assert summary["digital_accuracy"] is not None
+    assert (tmp_path / "digital" / "sample_0000" / "sample_0000.cir").exists()
+    assert (tmp_path / "digital" / "per_sample.csv").exists()
+
+
+def test_logit_only_accuracy_deck_saves_only_logits(tmp_path):
+    model = extract_full_model(_full_model_params(), "resonant_2x2", sample_rate=10.0)
+    cir_path = tmp_path / "full.cir"
+    netlist, _ = build_full_netlist(_full_model_params(), "resonant_2x2", sample_rate=10.0)
+    cir_path.write_text(netlist)
+
+    deck_path = write_logit_only_deck(
+        cir_path,
+        tmp_path / "sample.cir",
+        np.zeros((4, 1), dtype=np.float64),
+        model,
+        sample_rate=10.0,
+        max_step_divisor=20,
+    )
+    deck = deck_path.read_text()
+
+    save_line = next(line for line in deck.splitlines() if line.startswith(".save "))
+    assert "V(LOGIT0)" in save_line
+    assert "V(L0_B0_x0)" not in save_line
+    assert "V(L0_out0)" not in save_line
+    assert ".tran 0 0.4 0 0.005 uic" in deck
+
+
+def test_ltspice_accuracy_no_run_writes_pending_summary(tmp_path):
+    params = _full_model_params()
+    params_path = save_params_msgpack(params, tmp_path / "params.msgpack")
+    cir_path = tmp_path / "full.cir"
+    netlist, _ = build_full_netlist(params, "resonant_2x2", sample_rate=10.0)
+    cir_path.write_text(netlist)
+
+    summary = validate_ltspice_accuracy(
+        params_path=params_path,
+        cir_path=cir_path,
+        ssm_param="resonant_2x2",
+        sample_rate=10.0,
+        out_dir=tmp_path / "accuracy",
+        num_samples=2,
+        samples=np.zeros((2, 4, 1), dtype=np.float64),
+        labels=np.array([0, 1]),
+        run_sim=False,
+    )
+
+    assert summary["status"] == "pending"
+    assert summary["num_completed"] == 0
+    assert summary["digital_accuracy"] is not None
+    assert summary["comparison_semantics"] == "ltspice_continuous_cascade_vs_digital_stacked_recurrence"
+    assert "ltspice_vs_digital_final_logit_max_abs" in summary
+    assert "final_logit_max_abs" not in summary
+    assert (tmp_path / "accuracy" / "sample_00000" / "sample_00000.cir").exists()
+    assert (tmp_path / "accuracy" / "per_sample.csv").exists()
 
 
 def test_full_model_validation_artifacts_are_generated(tmp_path):

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 from pathlib import Path
 
@@ -11,13 +10,8 @@ import numpy as np
 from scipy.integrate import solve_ivp
 
 from .export_full_model import extract_full_model
-from .export_netlist import (
-    _output_node,
-    _state_node,
-    format_spice_value,
-    load_flax_params,
-    SUPPORTED_SSM_PARAMS,
-)
+from .export_netlist import _output_node, _state_node, format_spice_value, load_flax_params, SUPPORTED_SSM_PARAMS
+from .trace_utils import full_model_nodes, linear_nodes, write_trace_csv, zoh_pwl_source_line, zoh_value_at
 from .validate_transient import (
     interpolate_inputs,
     layer_input_matrix,
@@ -28,26 +22,7 @@ from .validate_transient import (
 )
 
 
-def _linear_nodes(prefix, count):
-    return [f"{prefix}{idx}" for idx in range(count)]
-
-
-def full_model_nodes(model):
-    nodes = ["IN0"]
-    nodes.extend(_linear_nodes("ENC", model.encoder_bias.shape[0]))
-    for layer_idx, layer in enumerate(model.ssm_layers):
-        nodes.extend(
-            _state_node(layer_idx, block_idx, state_idx)
-            for block_idx in range(layer.n_blocks)
-            for state_idx in range(2)
-        )
-        nodes.extend(_output_node(layer_idx, idx) for idx in range(layer.output_dim))
-        nodes.extend(_linear_nodes(f"RELU{layer_idx}_", layer.output_dim))
-    nodes.extend(_linear_nodes("LOGIT", model.decoder_bias.shape[0]))
-    return nodes
-
-
-def simulate_full_reference(model, times, inputs):
+def simulate_full_reference(model, times, inputs, input_mode="linear"):
     times = np.asarray(times, dtype=np.float64)
     state_sizes = [2 * layer.n_blocks for layer in model.ssm_layers]
     offsets = np.cumsum([0] + state_sizes)
@@ -59,7 +34,12 @@ def simulate_full_reference(model, times, inputs):
         return state[offsets[idx]:offsets[idx + 1]]
 
     def rhs(t, state):
-        u = interpolate_inputs(times, inputs, t)
+        if input_mode == "linear":
+            u = interpolate_inputs(times, inputs, t)
+        elif input_mode == "zoh":
+            u = zoh_value_at(times, inputs, t)
+        else:
+            raise ValueError("input_mode must be linear or zoh.")
         current = u @ model.encoder_kernel + model.encoder_bias
         derivs = []
         for idx, layer in enumerate(model.ssm_layers):
@@ -89,7 +69,7 @@ def simulate_full_reference(model, times, inputs):
 
     traces = {"time": times, "IN0": inputs[:, 0]}
     encoder = inputs @ model.encoder_kernel + model.encoder_bias
-    for idx, node in enumerate(_linear_nodes("ENC", encoder.shape[1])):
+    for idx, node in enumerate(linear_nodes("ENC", encoder.shape[1])):
         traces[node] = encoder[:, idx]
 
     current = encoder
@@ -99,31 +79,23 @@ def simulate_full_reference(model, times, inputs):
             node = _state_node(layer_idx, state_idx // 2, state_idx % 2)
             traces[node] = layer_states[:, state_idx]
         y = layer_states @ layer.C.T
-        for idx, node in enumerate(_linear_nodes(f"L{layer_idx}_out", layer.output_dim)):
+        for idx, node in enumerate(linear_nodes(f"L{layer_idx}_out", layer.output_dim)):
             traces[node] = y[:, idx]
         current = np.maximum(y, 0.0)
-        for idx, node in enumerate(_linear_nodes(f"RELU{layer_idx}_", current.shape[1])):
+        for idx, node in enumerate(linear_nodes(f"RELU{layer_idx}_", current.shape[1])):
             traces[node] = current[:, idx]
 
     logits = current @ model.decoder_kernel + model.decoder_bias
-    for idx, node in enumerate(_linear_nodes("LOGIT", logits.shape[1])):
+    for idx, node in enumerate(linear_nodes("LOGIT", logits.shape[1])):
         traces[node] = logits[:, idx]
     return traces
 
 
 def write_reference_csv(path, traces):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    headers = list(traces.keys())
-    with path.open("w", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(headers)
-        for row_idx in range(len(traces["time"])):
-            writer.writerow([format_spice_value(traces[key][row_idx]) for key in headers])
-    return path
+    return write_trace_csv(path, traces)
 
 
-def write_validation_deck(base_cir_path, out_path, times, inputs, model):
+def write_validation_deck(base_cir_path, out_path, times, inputs, model, input_mode="linear"):
     body = strip_final_end(Path(base_cir_path).read_text())
     duration = float(times[-1])
     output_step = duration / max(len(times) - 1, 1)
@@ -131,7 +103,12 @@ def write_validation_deck(base_cir_path, out_path, times, inputs, model):
     save_nodes = full_model_nodes(model)
 
     lines = [body, "", "* Full-model transient validation stimulus"]
-    lines.append(pwl_source_line("VSTIM_IN0", "IN0", times, inputs[:, 0]))
+    if input_mode == "linear":
+        lines.append(pwl_source_line("VSTIM_IN0", "IN0", times, inputs[:, 0]))
+    elif input_mode == "zoh":
+        lines.append(zoh_pwl_source_line("VSTIM_IN0", "IN0", output_step, inputs[:, 0]))
+    else:
+        raise ValueError("input_mode must be linear or zoh.")
     for layer_idx, layer in enumerate(model.ssm_layers):
         for block_idx in range(layer.n_blocks):
             for state_idx in range(2):
@@ -157,12 +134,13 @@ def generate_full_validation_artifacts(
     points=401,
     stimulus="sine",
     amplitude=0.05,
+    input_mode="linear",
 ):
     params = load_flax_params(params_path)
     model = extract_full_model(params, ssm_param, sample_rate)
     times = np.linspace(0.0, duration, points, dtype=np.float64)
     inputs = make_stimulus(times, 1, stimulus, amplitude)
-    traces = simulate_full_reference(model, times, inputs)
+    traces = simulate_full_reference(model, times, inputs, input_mode=input_mode)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +152,7 @@ def generate_full_validation_artifacts(
         times,
         inputs,
         model,
+        input_mode=input_mode,
     )
     metadata = {
         "params": str(params_path),
@@ -186,8 +165,9 @@ def generate_full_validation_artifacts(
         "points": int(points),
         "stimulus": stimulus,
         "amplitude": float(amplitude),
+        "input_mode": input_mode,
         "saved_nodes": save_nodes,
-        "logit_nodes": _linear_nodes("LOGIT", model.decoder_bias.shape[0]),
+        "logit_nodes": linear_nodes("LOGIT", model.decoder_bias.shape[0]),
         "ltspice_app": "/Applications/LTspice.app/Contents/SharedSupport/ltspice/LTspice/run_ltspice",
     }
     metadata_path = out_dir / f"{stem}_validation.json"
@@ -206,6 +186,7 @@ def parse_args(argv=None):
     parser.add_argument("--points", type=int, default=401)
     parser.add_argument("--stimulus", choices=["sine", "step", "impulse"], default="sine")
     parser.add_argument("--amplitude", type=float, default=0.05)
+    parser.add_argument("--input-mode", choices=["linear", "zoh"], default="linear")
     return parser.parse_args(argv)
 
 
@@ -221,6 +202,7 @@ def main(argv=None):
         args.points,
         args.stimulus,
         args.amplitude,
+        args.input_mode,
     )
     print(f"Wrote full-model validation deck: {metadata['validation_cir']}")
     print(f"Wrote full-model Python reference: {metadata['reference_csv']}")
