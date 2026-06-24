@@ -1,7 +1,9 @@
 from functools import partial
+from pathlib import Path
 from jax import random
 import jax.numpy as np
 from jax.scipy.linalg import block_diag
+from flax.serialization import to_bytes
 import wandb
 
 from .train_helpers import create_train_state, reduce_lr_on_plateau,\
@@ -19,6 +21,14 @@ from .ssm_parameterizations import (
     summarize_state_space,
 )
 from .diagnostics import plot_ssm_diagnostics
+
+
+def save_params_msgpack(params, out_path):
+    """Save a Flax params tree in the format consumed by spice.export_netlist."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(to_bytes({"params": params}))
+    return out_path
 
 
 def train(args):
@@ -231,6 +241,7 @@ def train(args):
     count, best_val_loss = 0, 100000000  # This line is for early stopping purposes
     lr_count, opt_acc = 0, -100000000.0  # This line is for learning rate decay
     step = 0  # for per step learning rate decay
+    best_params = state.params
     steps_per_epoch = int(train_size/args.bsz)
     for epoch in range(args.epochs):
         print(f"[*] Starting Training Epoch {epoch + 1}...")
@@ -315,6 +326,7 @@ def train(args):
             # Increment counters etc.
             count = 0
             best_loss, best_acc, best_epoch = val_loss, val_acc, epoch
+            best_params = state.params
             if valloader is not None:
                 best_test_loss, best_test_acc = test_loss, test_acc
             else:
@@ -413,3 +425,7 @@ def train(args):
 
     if getattr(args, "plot_ssm_diagnostics", False):
         plot_ssm_diagnostics(state.params, args)
+
+    if getattr(args, "save_params", False):
+        out_path = save_params_msgpack(best_params, args.params_out)
+        print("[*] Saved best params to {}".format(out_path))

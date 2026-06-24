@@ -89,6 +89,10 @@ if __name__ == "__main__":
 						help="DPI for SSM diagnostic figures")
 	parser.add_argument("--freq_response_points", type=int, default=256,
 						help="number of frequency grid points for SSM diagnostic plots")
+	parser.add_argument("--save_params", type=str2bool, default=False,
+						help="save best validation params as a Flax msgpack file")
+	parser.add_argument("--params_out", type=str, default="./checkpoints/model_params.msgpack",
+						help="path for --save_params output")
 
 	# Optimization Parameters
 	parser.add_argument("--prenorm", type=str2bool, default=True,
