@@ -10,7 +10,7 @@ set -euo pipefail
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate s5
 
-UCR_SPLIT_MODE=${UCR_SPLIT_MODE:-standard}
+UCR_SPLIT_MODE=${UCR_SPLIT_MODE:-combined}
 
 for dataset in ucr-ecg5000-classification ucr-forda-classification ucr-wafer-classification; do
   for seed in 0 1 2 3 4; do
