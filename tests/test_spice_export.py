@@ -8,21 +8,22 @@ from flax.serialization import to_bytes
 
 from s5.train import save_params_msgpack
 from s5.ssm_parameterizations import discretize_2x2_blocks, init_RealValuedSSM
+import spice.workflow as spice_workflow
+from spice.compare_transient import compare_traces
+from spice.export_full_model import (
+    build_full_netlist,
+    emit_linear_stage,
+    extract_full_model,
+)
 from spice.export_netlist import (
+    NetlistBuilder,
     build_netlist,
     find_ssm_modules,
     load_flax_params,
     module_to_layer,
     positive,
 )
-from spice.compare_transient import compare_traces
 from spice.metrics import trace_metrics
-from spice.export_full_model import (
-    build_full_netlist,
-    emit_linear_stage,
-    extract_full_model,
-)
-from spice.export_netlist import NetlistBuilder
 from spice.trace_utils import zoh_pwl_source_line
 from spice.validate_digital_alignment import (
     generate_digital_alignment_artifacts,
@@ -492,6 +493,34 @@ def test_unified_workflow_no_run_generates_artifacts(tmp_path):
     assert (tmp_path / "workflow" / "full_alignment" / "summary.json").exists()
     assert (tmp_path / "workflow" / "accuracy" / "summary.json").exists()
     assert summary["accuracy"]["status"] == "pending"
+
+
+def test_workflow_attempts_full_alignment_plots_for_each_sample(monkeypatch, tmp_path):
+    params = _full_model_params()
+    params_path = save_params_msgpack(params, tmp_path / "params.msgpack")
+    calls = []
+
+    def fake_plot(alignment_dir, model, sample_idx):
+        calls.append(sample_idx)
+        return {"state_plot": f"sample_{sample_idx}.png"}, []
+
+    monkeypatch.setattr(spice_workflow, "_plot_full_alignment_sample", fake_plot)
+
+    summary = run_workflow(
+        params_path=params_path,
+        ssm_param="resonant_2x2",
+        sample_rate=10.0,
+        out_dir=tmp_path / "workflow_plots",
+        full_samples=2,
+        accuracy_samples=2,
+        run_ltspice_enabled=False,
+        samples=np.zeros((2, 4, 1), dtype=np.float64),
+        labels=np.array([0, 1]),
+    )
+
+    assert calls == [0, 1]
+    assert sorted(summary["full_alignment_plots"]["plots"]) == ["sample_0000", "sample_0001"]
+    assert (tmp_path / "workflow_plots" / "full_alignment" / "per_layer_node_rrmse.csv").exists()
 
 
 def test_full_model_validation_artifacts_are_generated(tmp_path):

@@ -125,8 +125,10 @@ The workflow writes:
 - `netlists/ssm_layers.cir` and `netlists/full_model.cir`,
 - `layer_sanity/summary.json` plus per-layer Python reference CSV, LTSpice
   deck, rRMSE metrics, and state overlay PNGs,
-- `full_alignment/summary.json`, per-sample digital/continuous references, and
-  sample-0 state/logit plots when LTSpice `.raw` files are present,
+- `full_alignment/summary.json`, per-sample digital/continuous references,
+  per-layer state/output rRMSE tables, and per-sample plots for each layer's
+  worst two states, first-block states, and final logits when LTSpice `.raw`
+  files are present,
 - `accuracy/summary.json` and `accuracy/per_sample.csv` for logit-only test-set
   accuracy.
 

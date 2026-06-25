@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from .export_netlist import (
     load_flax_params,
     SUPPORTED_SSM_PARAMS,
 )
-from .metrics import trace_metrics
+from .metrics import rrmse, trace_metrics
 from .plots import plot_logit_bar, plot_trace_overlay
 from .trace_utils import linear_nodes
 from .validate_digital_alignment import (
@@ -73,6 +74,46 @@ def _layer_nodes(layer_idx, layer_manifest, role):
     if role == "output":
         return [_output_node(layer_idx, idx) for idx in range(layer_manifest["output_dim"])]
     raise ValueError("role must be state or output.")
+
+
+def _model_layer_nodes(model, layer_idx, role):
+    layer = model.ssm_layers[layer_idx]
+    if role == "state":
+        return [
+            _state_node(layer_idx, block_idx, state_idx)
+            for block_idx in range(layer.n_blocks)
+            for state_idx in range(2)
+        ]
+    if role == "output":
+        return [_output_node(layer_idx, idx) for idx in range(layer.output_dim)]
+    raise ValueError("role must be state or output.")
+
+
+def _node_rrmse_rows(sample_idx, layer_idx, reference, candidate, nodes, kind):
+    rows = []
+    for node in nodes:
+        rows.append(
+            {
+                "sample": int(sample_idx),
+                "layer": int(layer_idx),
+                "kind": kind,
+                "node": node,
+                "rrmse": rrmse(reference[node], candidate[node]),
+            }
+        )
+    return rows
+
+
+def _write_alignment_rrmse_csv(path, rows):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["sample", "layer", "kind", "node", "rrmse"]
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return path
 
 
 def run_layer_sanity(
@@ -153,25 +194,72 @@ def _plot_full_alignment_sample(alignment_dir, model, sample_idx=0):
     digital_path = sample_dir / "digital_reference.csv"
     raw_path = sample_dir / f"sample_{sample_idx:04d}.raw"
     if not digital_path.exists() or not raw_path.exists():
-        return {}
+        return {}, []
 
     state_nodes = []
+    output_nodes = []
     for layer_idx, layer in enumerate(model.ssm_layers):
-        state_nodes.extend(_state_node(layer_idx, 0, state_idx) for state_idx in range(min(2, 2 * layer.n_blocks)))
+        state_nodes.extend(_model_layer_nodes(model, layer_idx, "state"))
+        output_nodes.extend(_model_layer_nodes(model, layer_idx, "output"))
     logit_nodes = linear_nodes("LOGIT", model.decoder_bias.shape[0])
-    digital = _reference_trace(digital_path, state_nodes + logit_nodes)
+    digital = _reference_trace(digital_path, state_nodes + output_nodes + logit_nodes)
     raw = read_trace_table(raw_path)
-    ltspice = _table_trace(raw, digital["time"], state_nodes + logit_nodes)
+    ltspice = _table_trace(raw, digital["time"], state_nodes + output_nodes + logit_nodes)
 
-    state_plot = sample_dir / "state_alignment.png"
     logit_plot = sample_dir / "final_logits.png"
+    plots = {}
+    rrmse_rows = []
+    for layer_idx, _layer in enumerate(model.ssm_layers):
+        layer_state_nodes = _model_layer_nodes(model, layer_idx, "state")
+        layer_output_nodes = _model_layer_nodes(model, layer_idx, "output")
+        state_rows = _node_rrmse_rows(sample_idx, layer_idx, digital, ltspice, layer_state_nodes, "state")
+        output_rows = _node_rrmse_rows(sample_idx, layer_idx, digital, ltspice, layer_output_nodes, "output")
+        rrmse_rows.extend(state_rows)
+        rrmse_rows.extend(output_rows)
+
+        worst_nodes = [
+            row["node"]
+            for row in sorted(state_rows, key=lambda row: row["rrmse"], reverse=True)[:2]
+        ]
+        first_block_nodes = layer_state_nodes[:2]
+        layer_plots = {}
+        if worst_nodes:
+            worst_path = sample_dir / f"layer_{layer_idx:02d}_worst_states.png"
+            plot_trace_overlay(
+                worst_path,
+                digital["time"],
+                digital,
+                ltspice,
+                worst_nodes,
+                reference_label="digital",
+                candidate_label="ltspice",
+            )
+            layer_plots["worst_state_plot"] = _path(worst_path)
+        if first_block_nodes:
+            first_path = sample_dir / f"layer_{layer_idx:02d}_first_block_states.png"
+            plot_trace_overlay(
+                first_path,
+                digital["time"],
+                digital,
+                ltspice,
+                first_block_nodes,
+                reference_label="digital",
+                candidate_label="ltspice",
+            )
+            layer_plots["first_block_state_plot"] = _path(first_path)
+        plots[f"layer_{layer_idx:02d}"] = {
+            "worst_state_nodes": worst_nodes,
+            "first_block_state_nodes": first_block_nodes,
+            **layer_plots,
+        }
+
     if state_nodes:
         plot_trace_overlay(
-            state_plot,
+            sample_dir / "all_first_block_states.png",
             digital["time"],
             digital,
             ltspice,
-            state_nodes,
+            [_model_layer_nodes(model, layer_idx, "state")[idx] for layer_idx in range(len(model.ssm_layers)) for idx in range(2)],
             reference_label="digital",
             candidate_label="ltspice",
         )
@@ -181,7 +269,47 @@ def _plot_full_alignment_sample(alignment_dir, model, sample_idx=0):
         [ltspice[node][-1] for node in logit_nodes],
         title=f"Sample {sample_idx} final logits",
     )
-    return {"state_plot": _path(state_plot), "logit_plot": _path(logit_plot)}
+    plots["logit_plot"] = _path(logit_plot)
+    return plots, rrmse_rows
+
+
+def plot_full_alignment_samples(alignment_dir, model, num_samples):
+    plots = {}
+    rrmse_rows = []
+    for sample_idx in range(int(num_samples)):
+        sample_plots, sample_rows = _plot_full_alignment_sample(alignment_dir, model, sample_idx)
+        if sample_plots:
+            plots[f"sample_{sample_idx:04d}"] = sample_plots
+        rrmse_rows.extend(sample_rows)
+
+    metrics_path = Path(alignment_dir) / "per_layer_node_rrmse.csv"
+    _write_alignment_rrmse_csv(metrics_path, rrmse_rows)
+    summary_rows = []
+    for sample_idx in range(int(num_samples)):
+        for layer_idx in range(len(model.ssm_layers)):
+            for kind in ("state", "output"):
+                values = [
+                    row["rrmse"]
+                    for row in rrmse_rows
+                    if row["sample"] == sample_idx and row["layer"] == layer_idx and row["kind"] == kind
+                ]
+                if values:
+                    summary_rows.append(
+                        {
+                            "sample": sample_idx,
+                            "layer": layer_idx,
+                            "kind": kind,
+                            "max_rrmse": float(np.max(values)),
+                            "mean_rrmse": float(np.mean(values)),
+                        }
+                    )
+    summary_path = Path(alignment_dir) / "per_layer_rrmse_summary.json"
+    summary_path.write_text(json.dumps(summary_rows, indent=2, sort_keys=True))
+    return {
+        "plots": plots,
+        "per_node_rrmse_csv": _path(metrics_path),
+        "per_layer_rrmse_json": _path(summary_path),
+    }
 
 
 def run_workflow(
@@ -278,7 +406,7 @@ def run_workflow(
 
     params = load_flax_params(params_path)
     model = extract_full_model(params, ssm_param, sample_rate)
-    alignment_plots = _plot_full_alignment_sample(alignment_dir, model, 0)
+    alignment_plots = plot_full_alignment_samples(alignment_dir, model, full_samples)
 
     accuracy_summary = validate_ltspice_accuracy(
         params_path=params_path,
