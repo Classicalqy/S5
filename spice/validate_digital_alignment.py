@@ -16,6 +16,7 @@ from s5.ssm_parameterizations import discretize_2x2_blocks
 from .compare_transient import canonical_column, read_trace_table
 from .export_full_model import extract_full_model
 from .export_netlist import _output_node, _state_node, format_spice_value, load_flax_params, SUPPORTED_SSM_PARAMS
+from .metrics import trace_metrics
 from .trace_utils import full_model_nodes, linear_nodes, write_trace_csv, zoh_pwl_source_line, zoh_sample_times
 from .validate_transient import layer_input_matrix, layer_state_matrix, strip_final_end
 
@@ -135,14 +136,7 @@ def logits_from_trace(trace, model):
 
 
 def trace_error(reference, candidate, nodes):
-    diffs = []
-    for node in nodes:
-        diffs.append(np.asarray(candidate[node]) - np.asarray(reference[node]))
-    diff = np.concatenate([d.reshape(-1) for d in diffs])
-    return {
-        "max_abs": float(np.max(np.abs(diff))),
-        "rmse": float(np.sqrt(np.mean(diff ** 2))),
-    }
+    return trace_metrics(reference, candidate, nodes)
 
 
 def read_ltspice_trace(raw_path, times, nodes):
@@ -222,11 +216,17 @@ def write_per_sample_csv(path, rows):
         "continuous_pred",
         "ltspice_pred",
         "continuous_final_logit_max_abs",
+        "continuous_final_logit_rrmse",
         "continuous_trace_max_abs",
+        "continuous_trace_rrmse",
         "ltspice_final_logit_max_abs",
+        "ltspice_final_logit_rrmse",
         "ltspice_trace_max_abs",
+        "ltspice_trace_rrmse",
         "ltspice_vs_continuous_final_logit_max_abs",
+        "ltspice_vs_continuous_final_logit_rrmse",
         "ltspice_vs_continuous_trace_max_abs",
+        "ltspice_vs_continuous_trace_rrmse",
         "ltspice_status",
         "deck",
     ]
@@ -258,16 +258,28 @@ def build_summary(rows):
             ltspice,
         ),
         "continuous_final_logit_max_abs": max(row["continuous_final_logit_max_abs"] for row in rows),
+        "continuous_final_logit_rrmse": max(row["continuous_final_logit_rrmse"] for row in rows),
         "continuous_trace_max_abs": max(row["continuous_trace_max_abs"] for row in rows),
+        "continuous_trace_rrmse": max(row["continuous_trace_rrmse"] for row in rows),
         "ltspice_final_logit_max_abs": (
             max(row["ltspice_final_logit_max_abs"] for row in lt_rows) if lt_rows else None
         ),
+        "ltspice_final_logit_rrmse": (
+            max(row["ltspice_final_logit_rrmse"] for row in lt_rows) if lt_rows else None
+        ),
         "ltspice_trace_max_abs": max(row["ltspice_trace_max_abs"] for row in lt_rows) if lt_rows else None,
+        "ltspice_trace_rrmse": max(row["ltspice_trace_rrmse"] for row in lt_rows) if lt_rows else None,
         "ltspice_vs_continuous_final_logit_max_abs": (
             max(row["ltspice_vs_continuous_final_logit_max_abs"] for row in lt_rows) if lt_rows else None
         ),
+        "ltspice_vs_continuous_final_logit_rrmse": (
+            max(row["ltspice_vs_continuous_final_logit_rrmse"] for row in lt_rows) if lt_rows else None
+        ),
         "ltspice_vs_continuous_trace_max_abs": (
             max(row["ltspice_vs_continuous_trace_max_abs"] for row in lt_rows) if lt_rows else None
+        ),
+        "ltspice_vs_continuous_trace_rrmse": (
+            max(row["ltspice_vs_continuous_trace_rrmse"] for row in lt_rows) if lt_rows else None
         ),
     }
 
@@ -310,6 +322,11 @@ def generate_digital_alignment_artifacts(
         digital_logits = logits_from_trace(digital, model)
         continuous_logits = logits_from_trace(continuous, model)
         continuous_final = np.abs(continuous_logits[-1] - digital_logits[-1])
+        continuous_final_error = trace_metrics(
+            {"logits": digital_logits[-1]},
+            {"logits": continuous_logits[-1]},
+            ["logits"],
+        )
         continuous_trace_error = trace_error(digital, continuous, nodes)
         row = {
             "sample": sample_idx,
@@ -317,12 +334,18 @@ def generate_digital_alignment_artifacts(
             "digital_pred": int(np.argmax(digital_logits[-1])),
             "continuous_pred": int(np.argmax(continuous_logits[-1])),
             "continuous_final_logit_max_abs": float(np.max(continuous_final)),
+            "continuous_final_logit_rrmse": continuous_final_error["rrmse"],
             "continuous_trace_max_abs": continuous_trace_error["max_abs"],
+            "continuous_trace_rrmse": continuous_trace_error["rrmse"],
             "ltspice_pred": None,
             "ltspice_final_logit_max_abs": None,
+            "ltspice_final_logit_rrmse": None,
             "ltspice_trace_max_abs": None,
+            "ltspice_trace_rrmse": None,
             "ltspice_vs_continuous_final_logit_max_abs": None,
+            "ltspice_vs_continuous_final_logit_rrmse": None,
             "ltspice_vs_continuous_trace_max_abs": None,
+            "ltspice_vs_continuous_trace_rrmse": None,
             "ltspice_status": "pending",
             "deck": str(deck_path),
         }
@@ -332,13 +355,29 @@ def generate_digital_alignment_artifacts(
             ltspice = read_ltspice_trace(raw_path, digital["time"], nodes + logit_nodes)
             ltspice_logits = logits_from_trace(ltspice, model)
             ltspice_continuous_final = np.abs(ltspice_logits[-1] - continuous_logits[-1])
+            ltspice_final_error = trace_metrics(
+                {"logits": digital_logits[-1]},
+                {"logits": ltspice_logits[-1]},
+                ["logits"],
+            )
+            ltspice_continuous_final_error = trace_metrics(
+                {"logits": continuous_logits[-1]},
+                {"logits": ltspice_logits[-1]},
+                ["logits"],
+            )
+            ltspice_trace_error = trace_error(digital, ltspice, nodes)
+            ltspice_continuous_trace_error = trace_error(continuous, ltspice, nodes)
             row.update(
                 {
                     "ltspice_pred": int(np.argmax(ltspice_logits[-1])),
                     "ltspice_final_logit_max_abs": float(np.max(np.abs(ltspice_logits[-1] - digital_logits[-1]))),
-                    "ltspice_trace_max_abs": trace_error(digital, ltspice, nodes)["max_abs"],
+                    "ltspice_final_logit_rrmse": ltspice_final_error["rrmse"],
+                    "ltspice_trace_max_abs": ltspice_trace_error["max_abs"],
+                    "ltspice_trace_rrmse": ltspice_trace_error["rrmse"],
                     "ltspice_vs_continuous_final_logit_max_abs": float(np.max(ltspice_continuous_final)),
-                    "ltspice_vs_continuous_trace_max_abs": trace_error(continuous, ltspice, nodes)["max_abs"],
+                    "ltspice_vs_continuous_final_logit_rrmse": ltspice_continuous_final_error["rrmse"],
+                    "ltspice_vs_continuous_trace_max_abs": ltspice_continuous_trace_error["max_abs"],
+                    "ltspice_vs_continuous_trace_rrmse": ltspice_continuous_trace_error["rrmse"],
                     "ltspice_status": "complete",
                 }
             )

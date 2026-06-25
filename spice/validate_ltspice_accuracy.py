@@ -104,6 +104,7 @@ def write_rows(path, rows, n_classes):
         "status",
         LOGIT_MAX_ABS_FIELD,
         LOGIT_RMSE_FIELD,
+        "error",
         "deck",
         "raw",
     ]
@@ -167,6 +168,70 @@ def run_ltspice(ltspice_bin, deck_path):
     )
 
 
+def sample_paths(out_dir, sample_idx):
+    sample_dir = Path(out_dir) / f"sample_{sample_idx:05d}"
+    deck_path = sample_dir / f"sample_{sample_idx:05d}.cir"
+    return deck_path, deck_path.with_suffix(".raw"), deck_path.with_suffix(".log")
+
+
+def run_accuracy_sample(
+    sample_idx,
+    inputs,
+    label,
+    model,
+    cir_path,
+    sample_rate,
+    out_dir,
+    logit_nodes,
+    ltspice_bin,
+    max_step_divisor,
+    delete_raw_after_read,
+    delete_log_after_read,
+    run_sim,
+):
+    deck_path, raw_path, log_path = sample_paths(out_dir, sample_idx)
+    deck_path = write_logit_only_deck(cir_path, deck_path, inputs, model, sample_rate, max_step_divisor)
+    digital_logits = final_logits_from_digital(model, inputs, sample_rate)
+    row = {
+        "sample": sample_idx,
+        "label": int(label),
+        "digital_pred": int(np.argmax(digital_logits)),
+        "status": "pending",
+        "deck": str(deck_path),
+        "raw": str(raw_path),
+    }
+    row.update({f"digital_logit{i}": format_spice_value(value) for i, value in enumerate(digital_logits)})
+
+    if run_sim and not raw_path.exists():
+        result = run_ltspice(ltspice_bin, deck_path)
+        if result.returncode != 0:
+            row.update({"status": "ltspice_failed", "ltspice_pred": "", "error": f"returncode={result.returncode}"})
+            return sample_idx, row
+
+    if raw_path.exists():
+        try:
+            final_time = inputs.shape[0] / float(sample_rate)
+            ltspice_logits = final_logits_from_raw(raw_path, logit_nodes, final_time)
+        except Exception as exc:
+            row.update({"status": "raw_read_failed", "ltspice_pred": "", "error": str(exc)})
+            return sample_idx, row
+        diff = ltspice_logits - digital_logits
+        row.update(
+            {
+                "ltspice_pred": int(np.argmax(ltspice_logits)),
+                "status": "complete",
+                LOGIT_MAX_ABS_FIELD: format_spice_value(np.max(np.abs(diff))),
+                LOGIT_RMSE_FIELD: format_spice_value(np.sqrt(np.mean(diff ** 2))),
+            }
+        )
+        row.update({f"ltspice_logit{i}": format_spice_value(value) for i, value in enumerate(ltspice_logits)})
+        if delete_raw_after_read:
+            raw_path.unlink(missing_ok=True)
+        if delete_log_after_read:
+            log_path.unlink(missing_ok=True)
+    return sample_idx, row
+
+
 def validate_ltspice_accuracy(
     params_path,
     cir_path,
@@ -214,57 +279,45 @@ def validate_ltspice_accuracy(
         ),
     }
 
-    for sample_idx, (inputs, label) in enumerate(zip(samples, labels)):
-        existing = rows.get(sample_idx)
-        if existing and existing.get("status") == "complete":
-            continue
+    pending = [
+        (sample_idx, inputs, labels[sample_idx])
+        for sample_idx, inputs in enumerate(samples)
+        if not (rows.get(sample_idx) and rows[sample_idx].get("status") == "complete")
+    ]
 
-        sample_dir = out_dir / f"sample_{sample_idx:05d}"
-        deck_path = sample_dir / f"sample_{sample_idx:05d}.cir"
-        raw_path = deck_path.with_suffix(".raw")
-        log_path = deck_path.with_suffix(".log")
-        deck_path = write_logit_only_deck(cir_path, deck_path, inputs, model, sample_rate, max_step_divisor)
-        digital_logits = final_logits_from_digital(model, inputs, sample_rate)
-        row = {
-            "sample": sample_idx,
-            "label": int(label),
-            "digital_pred": int(np.argmax(digital_logits)),
-            "status": "pending",
-            "deck": str(deck_path),
-            "raw": str(raw_path),
-        }
-        row.update({f"digital_logit{i}": format_spice_value(value) for i, value in enumerate(digital_logits)})
-
-        if run_sim and not raw_path.exists():
-            result = run_ltspice(ltspice_bin, deck_path)
-            if result.returncode != 0:
-                row["status"] = "ltspice_failed"
-                row["ltspice_pred"] = ""
-                rows[sample_idx] = row
-                write_rows(per_sample_path, rows, model.decoder_bias.shape[0])
-                write_summary(summary_path, rows, num_samples, metadata)
-                continue
-
-        if raw_path.exists():
-            final_time = inputs.shape[0] / float(sample_rate)
-            ltspice_logits = final_logits_from_raw(raw_path, logit_nodes, final_time)
-            diff = ltspice_logits - digital_logits
-            row.update(
-                {
-                    "ltspice_pred": int(np.argmax(ltspice_logits)),
-                    "status": "complete",
-                    LOGIT_MAX_ABS_FIELD: format_spice_value(np.max(np.abs(diff))),
-                    LOGIT_RMSE_FIELD: format_spice_value(np.sqrt(np.mean(diff ** 2))),
-                }
-            )
-            row.update({f"ltspice_logit{i}": format_spice_value(value) for i, value in enumerate(ltspice_logits)})
-            if delete_raw_after_read:
-                raw_path.unlink(missing_ok=True)
-            if delete_log_after_read:
-                log_path.unlink(missing_ok=True)
+    def finish(sample_idx, row):
         rows[sample_idx] = row
         write_rows(per_sample_path, rows, model.decoder_bias.shape[0])
         write_summary(summary_path, rows, num_samples, metadata)
+
+    for sample_idx, inputs, label in pending:
+        try:
+            _, row = run_accuracy_sample(
+                sample_idx,
+                inputs,
+                label,
+                model,
+                cir_path,
+                sample_rate,
+                out_dir,
+                logit_nodes,
+                ltspice_bin,
+                max_step_divisor,
+                delete_raw_after_read,
+                delete_log_after_read,
+                run_sim,
+            )
+        except Exception as exc:
+            deck_path, raw_path, _ = sample_paths(out_dir, sample_idx)
+            row = {
+                "sample": sample_idx,
+                "label": int(labels[sample_idx]),
+                "status": "error",
+                "error": str(exc),
+                "deck": str(deck_path),
+                "raw": str(raw_path),
+            }
+        finish(sample_idx, row)
 
     write_rows(per_sample_path, rows, model.decoder_bias.shape[0])
     return write_summary(summary_path, rows, num_samples, metadata)

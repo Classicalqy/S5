@@ -106,6 +106,34 @@ hardware, an inter-layer sample-and-hold stage is needed.
 
 ## Validation Modes
 
+For the full export-and-validation flow, use:
+
+```bash
+python -m spice.workflow \
+  --params checkpoints/mnist_resonant_2x2_seed0_params.msgpack \
+  --ssm-param resonant_2x2 \
+  --sample-rate 16000 \
+  --out-dir out/spice_workflow \
+  --full-samples 5 \
+  --accuracy-samples 100 \
+  --delete-raw-after-read \
+  --delete-log-after-read
+```
+
+The workflow writes:
+
+- `netlists/ssm_layers.cir` and `netlists/full_model.cir`,
+- `layer_sanity/summary.json` plus per-layer Python reference CSV, LTSpice
+  deck, rRMSE metrics, and state overlay PNGs,
+- `full_alignment/summary.json`, per-sample digital/continuous references, and
+  sample-0 state/logit plots when LTSpice `.raw` files are present,
+- `accuracy/summary.json` and `accuracy/per_sample.csv` for logit-only test-set
+  accuracy.
+
+Use `--no-run-ltspice` to only generate netlists, decks, references, and pending
+summaries. Re-running the same command with the same `--out-dir` resumes
+completed accuracy samples and reuses existing `.raw` files.
+
 `spice.validate_digital_alignment` compares three references:
 
 - digital ZOH SSM recurrence used by training,

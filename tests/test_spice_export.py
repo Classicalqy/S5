@@ -16,6 +16,7 @@ from spice.export_netlist import (
     positive,
 )
 from spice.compare_transient import compare_traces
+from spice.metrics import trace_metrics
 from spice.export_full_model import (
     build_full_netlist,
     emit_linear_stage,
@@ -32,6 +33,7 @@ from spice.validate_digital_alignment import (
 from spice.validate_full_model import generate_full_validation_artifacts, simulate_full_reference
 from spice.validate_ltspice_accuracy import validate_ltspice_accuracy, write_logit_only_deck
 from spice.validate_transient import generate_validation_artifacts, make_stimulus, simulate_layer_reference
+from spice.workflow import run_workflow
 
 
 def _single_ssm_params(ssm_param="resonant_2x2", H=2, P=4):
@@ -294,6 +296,17 @@ def test_compare_traces_can_focus_final_sample(tmp_path):
     np.testing.assert_allclose(results["l0_out0"]["max_abs"], 0.01)
 
 
+def test_trace_metrics_include_rrmse():
+    reference = {"x": np.array([1.0, 2.0, 3.0])}
+    candidate = {"x": np.array([1.0, 2.0, 4.0])}
+
+    metrics = trace_metrics(reference, candidate, ["x"])
+
+    assert metrics["rmse"] > 0
+    assert metrics["rrmse"] > 0
+    np.testing.assert_allclose(metrics["max_abs"], 1.0)
+
+
 def test_linear_stage_signs_and_bias_are_explicit():
     builder = NetlistBuilder()
 
@@ -455,6 +468,30 @@ def test_ltspice_accuracy_no_run_writes_pending_summary(tmp_path):
     assert "final_logit_max_abs" not in summary
     assert (tmp_path / "accuracy" / "sample_00000" / "sample_00000.cir").exists()
     assert (tmp_path / "accuracy" / "per_sample.csv").exists()
+
+
+def test_unified_workflow_no_run_generates_artifacts(tmp_path):
+    params = _full_model_params()
+    params_path = save_params_msgpack(params, tmp_path / "params.msgpack")
+
+    summary = run_workflow(
+        params_path=params_path,
+        ssm_param="resonant_2x2",
+        sample_rate=10.0,
+        out_dir=tmp_path / "workflow",
+        full_samples=2,
+        accuracy_samples=2,
+        run_ltspice_enabled=False,
+        samples=np.zeros((2, 4, 1), dtype=np.float64),
+        labels=np.array([0, 1]),
+    )
+
+    assert (tmp_path / "workflow" / "netlists" / "ssm_layers.cir").exists()
+    assert (tmp_path / "workflow" / "netlists" / "full_model.cir").exists()
+    assert (tmp_path / "workflow" / "layer_sanity" / "summary.json").exists()
+    assert (tmp_path / "workflow" / "full_alignment" / "summary.json").exists()
+    assert (tmp_path / "workflow" / "accuracy" / "summary.json").exists()
+    assert summary["accuracy"]["status"] == "pending"
 
 
 def test_full_model_validation_artifacts_are_generated(tmp_path):

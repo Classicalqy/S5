@@ -9,3 +9,4 @@ jaxlib==0.3.5
 jax==0.3.5
 scipy
 einops
+matplotlib
