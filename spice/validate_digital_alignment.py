@@ -135,10 +135,6 @@ def logits_from_trace(trace, model):
     return np.stack([trace[node] for node in linear_nodes("LOGIT", model.decoder_bias.shape[0])], axis=-1)
 
 
-def trace_error(reference, candidate, nodes):
-    return trace_metrics(reference, candidate, nodes)
-
-
 def read_ltspice_trace(raw_path, times, nodes):
     table = read_trace_table(raw_path)
     if "time" not in table:
@@ -327,7 +323,7 @@ def generate_digital_alignment_artifacts(
             {"logits": continuous_logits[-1]},
             ["logits"],
         )
-        continuous_trace_error = trace_error(digital, continuous, nodes)
+        continuous_trace_error = trace_metrics(digital, continuous, nodes)
         row = {
             "sample": sample_idx,
             "label": int(label),
@@ -365,8 +361,8 @@ def generate_digital_alignment_artifacts(
                 {"logits": ltspice_logits[-1]},
                 ["logits"],
             )
-            ltspice_trace_error = trace_error(digital, ltspice, nodes)
-            ltspice_continuous_trace_error = trace_error(continuous, ltspice, nodes)
+            ltspice_trace_error = trace_metrics(digital, ltspice, nodes)
+            ltspice_continuous_trace_error = trace_metrics(continuous, ltspice, nodes)
             row.update(
                 {
                     "ltspice_pred": int(np.argmax(ltspice_logits[-1])),

@@ -31,7 +31,6 @@ from spice.validate_digital_alignment import (
     simulate_full_continuous_zoh,
     simulate_full_digital,
 )
-from spice.validate_full_model import generate_full_validation_artifacts, simulate_full_reference
 from spice.validate_ltspice_accuracy import validate_ltspice_accuracy, write_logit_only_deck
 from spice.validate_transient import generate_validation_artifacts, make_stimulus, simulate_layer_reference
 from spice.workflow import run_workflow
@@ -352,18 +351,6 @@ def test_full_model_manifest_records_continuous_cascade_semantics():
     assert "activation_fn=relu" in manifest["assumptions"]
 
 
-def test_full_model_reference_returns_logit_traces():
-    model = extract_full_model(_full_model_params(), "resonant_2x2", sample_rate=10.0)
-    times = np.linspace(0.0, 0.01, 11)
-    inputs = make_stimulus(times, input_dim=1, kind="sine", amplitude=0.1)
-
-    traces = simulate_full_reference(model, times, inputs)
-
-    assert traces["LOGIT0"].shape == (11,)
-    assert traces["LOGIT2"].shape == (11,)
-    np.testing.assert_allclose(traces["LOGIT0"][0], model.decoder_bias[0])
-
-
 def test_digital_discrete_matrices_match_training_zoh_discretizer():
     model = extract_full_model(_full_model_params(), "resonant_2x2", sample_rate=10.0)
     layer = model.ssm_layers[0]
@@ -521,28 +508,3 @@ def test_workflow_attempts_full_alignment_plots_for_each_sample(monkeypatch, tmp
     assert calls == [0, 1]
     assert sorted(summary["full_alignment_plots"]["plots"]) == ["sample_0000", "sample_0001"]
     assert (tmp_path / "workflow_plots" / "full_alignment" / "per_layer_node_rrmse.csv").exists()
-
-
-def test_full_model_validation_artifacts_are_generated(tmp_path):
-    params = _full_model_params()
-    params_path = save_params_msgpack(params, tmp_path / "params.msgpack")
-    cir_path = tmp_path / "full.cir"
-    netlist, _ = build_full_netlist(params, "resonant_2x2", sample_rate=10.0)
-    cir_path.write_text(netlist)
-
-    metadata = generate_full_validation_artifacts(
-        params_path=params_path,
-        cir_path=cir_path,
-        ssm_param="resonant_2x2",
-        sample_rate=10.0,
-        out_dir=tmp_path / "validation_full",
-        duration=0.01,
-        points=11,
-    )
-
-    deck = (tmp_path / "validation_full" / "full_validation.cir").read_text()
-    assert ".tran" in deck and "uic" in deck
-    assert "PWL(" in deck
-    assert "B_RELU0_0" in deck
-    assert "V(LOGIT0)" in deck
-    assert metadata["logit_nodes"] == ["LOGIT0", "LOGIT1", "LOGIT2"]

@@ -33,10 +33,6 @@ def _path(value):
     return str(Path(value))
 
 
-def _ltspice_raw_path(deck_path):
-    return Path(deck_path).with_suffix(".raw")
-
-
 def _table_trace(table, times, nodes):
     trace = {"time": np.asarray(times, dtype=np.float64)}
     for node in nodes:
@@ -56,7 +52,7 @@ def _reference_trace(csv_path, nodes):
 
 
 def _maybe_run_ltspice(deck_path, ltspice_bin, run_ltspice_enabled):
-    raw_path = _ltspice_raw_path(deck_path)
+    raw_path = Path(deck_path).with_suffix(".raw")
     if run_ltspice_enabled and not raw_path.exists():
         result = run_ltspice(ltspice_bin, deck_path)
         if result.returncode != 0:
@@ -253,16 +249,6 @@ def _plot_full_alignment_sample(alignment_dir, model, sample_idx=0):
             **layer_plots,
         }
 
-    if state_nodes:
-        plot_trace_overlay(
-            sample_dir / "all_first_block_states.png",
-            digital["time"],
-            digital,
-            ltspice,
-            [_model_layer_nodes(model, layer_idx, "state")[idx] for layer_idx in range(len(model.ssm_layers)) for idx in range(2)],
-            reference_label="digital",
-            candidate_label="ltspice",
-        )
     plot_logit_bar(
         logit_plot,
         [digital[node][-1] for node in logit_nodes],

@@ -26,17 +26,6 @@ def positive(raw, eps=POSITIVE_EPS):
     return softplus(raw) + eps
 
 
-def sanitize_name(name):
-    out = []
-    for char in str(name):
-        if char.isalnum():
-            out.append(char)
-        else:
-            out.append("_")
-    sanitized = "".join(out).strip("_")
-    return sanitized or "root"
-
-
 def format_spice_value(value):
     if not np.isfinite(value):
         raise ValueError("SPICE component values must be finite.")
