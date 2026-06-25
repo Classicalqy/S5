@@ -12,9 +12,15 @@ from flax.serialization import msgpack_restore
 
 
 POSITIVE_EPS = 1e-4
-SUPPORTED_SSM_PARAMS = {"resonant_2x2", "energy_shaped_2x2"}
+SSM_PARAM_REAL_DECAY = "real_decay"
+SSM_PARAM_RESONANT_2X2 = "resonant_2x2"
+SSM_PARAM_ENERGY_SHAPED_2X2 = "energy_shaped_2x2"
+SUPPORTED_SSM_PARAMS = {
+    SSM_PARAM_REAL_DECAY,
+    SSM_PARAM_RESONANT_2X2,
+    SSM_PARAM_ENERGY_SHAPED_2X2,
+}
 DEFAULT_FEEDBACK_RESISTANCE = 10_000.0
-DEFAULT_DUMMY_MARGIN = 1.0
 
 
 def softplus(x):
@@ -58,7 +64,7 @@ def find_ssm_modules(params):
         if not _is_mapping(tree):
             return
         keys = set(tree.keys())
-        if {"B", "C", "raw_alpha", "omega", "log_step"}.issubset(keys):
+        if {"B", "C", "raw_alpha", "log_step"}.issubset(keys):
             modules.append((prefix or "root", tree))
         for key, value in tree.items():
             if _is_mapping(value):
@@ -72,6 +78,8 @@ def find_ssm_modules(params):
 @dataclass(frozen=True)
 class SsmLayer:
     path: str
+    ssm_param: str
+    state_width: int
     B: np.ndarray
     C: np.ndarray
     alpha: np.ndarray
@@ -93,56 +101,90 @@ class SsmLayer:
     def output_dim(self):
         return int(self.C.shape[0])
 
+    @property
+    def state_dim(self):
+        return int(self.n_blocks * self.state_width)
+
+    @property
+    def block_suffix(self):
+        return "real_decay" if self.state_width == 1 else "2x2"
+
+    def state_nodes(self, layer_idx):
+        return [
+            _state_node(layer_idx, block_idx, state_idx)
+            for block_idx in range(self.n_blocks)
+            for state_idx in range(self.state_width)
+        ]
+
 
 def module_to_layer(path, module, ssm_param, sample_rate):
     B = np.asarray(module["B"], dtype=np.float64)
     C = np.asarray(module["C"], dtype=np.float64)
     raw_alpha = np.asarray(module["raw_alpha"], dtype=np.float64)
-    omega = np.asarray(module["omega"], dtype=np.float64)
     log_step = np.asarray(module["log_step"], dtype=np.float64)
 
     if ssm_param not in SUPPORTED_SSM_PARAMS:
         raise ValueError(
-            "Only resonant_2x2 and energy_shaped_2x2 are supported by this exporter."
+            "Only real_decay, resonant_2x2, and energy_shaped_2x2 are supported by this exporter."
         )
     if B.ndim != 2 or C.ndim != 2:
         raise ValueError(f"{path}: expected B and C to be rank-2 arrays.")
-    if B.shape[0] % 2 != 0:
-        raise ValueError(f"{path}: B first dimension must be even for 2x2 blocks.")
 
-    n_blocks = B.shape[0] // 2
+    if ssm_param == SSM_PARAM_REAL_DECAY:
+        state_width = 1
+        n_blocks = B.shape[0]
+    else:
+        state_width = 2
+        if B.shape[0] % 2 != 0:
+            raise ValueError(f"{path}: B first dimension must be even for 2x2 blocks.")
+        n_blocks = B.shape[0] // 2
+
     if raw_alpha.shape != (n_blocks,):
         raise ValueError(f"{path}: raw_alpha shape must be ({n_blocks},).")
-    if omega.shape != (n_blocks,):
-        raise ValueError(f"{path}: omega shape must be ({n_blocks},).")
     if log_step.shape[0] != n_blocks:
         raise ValueError(f"{path}: log_step first dimension must be {n_blocks}.")
     if C.shape[1] != B.shape[0]:
         raise ValueError(f"{path}: C second dimension must match B first dimension.")
 
     alpha = positive(raw_alpha)
-    if ssm_param == "energy_shaped_2x2":
-        if "raw_q" not in module:
-            raise ValueError(f"{path}: energy_shaped_2x2 requires raw_q.")
-        q = positive(np.asarray(module["raw_q"], dtype=np.float64))
-    else:
-        q = np.ones((n_blocks,), dtype=np.float64)
-
     delta = np.exp(log_step[:, 0])
-    decay = q * alpha
-    frequency = q * omega
-    A = np.stack(
-        (
-            np.stack((-decay, -frequency), axis=-1),
-            np.stack((frequency, -decay), axis=-1),
-        ),
-        axis=-2,
-    )
-    A_tr = sample_rate * delta[:, None, None] * A
-    B_blocks = B.reshape((n_blocks, 2, B.shape[1]))
-    B_tr = sample_rate * delta[:, None, None] * B_blocks
+    if ssm_param == SSM_PARAM_REAL_DECAY:
+        omega = np.zeros((n_blocks,), dtype=np.float64)
+        q = np.ones((n_blocks,), dtype=np.float64)
+        A_tr = sample_rate * delta[:, None, None] * (-alpha[:, None, None])
+        B_tr = sample_rate * delta[:, None, None] * B[:, None, :]
+    else:
+        if "omega" not in module:
+            raise ValueError(f"{path}: {ssm_param} requires omega.")
+        omega = np.asarray(module["omega"], dtype=np.float64)
+        if omega.shape != (n_blocks,):
+            raise ValueError(f"{path}: omega shape must be ({n_blocks},).")
+        if ssm_param == SSM_PARAM_ENERGY_SHAPED_2X2:
+            if "raw_q" not in module:
+                raise ValueError(f"{path}: energy_shaped_2x2 requires raw_q.")
+            q = positive(np.asarray(module["raw_q"], dtype=np.float64))
+        else:
+            q = np.ones((n_blocks,), dtype=np.float64)
+
+        decay = q * alpha
+        frequency = q * omega
+        A = np.stack(
+            (
+                np.stack((-decay, -frequency), axis=-1),
+                np.stack((frequency, -decay), axis=-1),
+            ),
+            axis=-2,
+        )
+        A_tr = sample_rate * delta[:, None, None] * A
+        B_blocks = B.reshape((n_blocks, 2, B.shape[1]))
+        B_tr = sample_rate * delta[:, None, None] * B_blocks
+
+    if ssm_param == SSM_PARAM_ENERGY_SHAPED_2X2 and q.shape != (n_blocks,):
+        raise ValueError(f"{path}: raw_q shape must be ({n_blocks},).")
     return SsmLayer(
         path=path,
+        ssm_param=ssm_param,
+        state_width=state_width,
         B=B,
         C=C,
         alpha=alpha,
@@ -184,13 +226,20 @@ def _output_node(layer_idx, output_idx):
     return f"L{layer_idx}_out{output_idx}"
 
 
-def _block_name(layer_idx, block_idx):
-    return f"s5_L{layer_idx}_B{block_idx}_2x2"
+def _block_name(layer_idx, block_idx, suffix="2x2"):
+    return f"s5_L{layer_idx}_B{block_idx}_{suffix}"
+
+
+def _layer_block_name(layer, layer_idx, block_idx):
+    return _block_name(layer_idx, block_idx, layer.block_suffix)
 
 
 def _subckt_pin_list(layer, layer_idx, block_idx):
     inputs = [_input_node(layer_idx, i) for i in range(layer.input_dim)]
-    states = [_state_node(layer_idx, block_idx, 0), _state_node(layer_idx, block_idx, 1)]
+    states = [
+        _state_node(layer_idx, block_idx, state_idx)
+        for state_idx in range(layer.state_width)
+    ]
     return inputs + states
 
 
@@ -228,96 +277,116 @@ def add_model_header(builder, state_capacitance, dense_included=False):
     builder.line()
 
 
-def source_for_integrator_gain(layer_idx, block_idx, state_idx, gain, source_node):
-    if gain < 0:
-        return source_node, "direct"
-    inv_node = f"{source_node}_inv_L{layer_idx}_B{block_idx}_S{state_idx}"
-    return inv_node, "inverted"
+def add_unity_inverter(builder, components, name, source_node, output_node):
+    builder.component(name, f"{name} {source_node} {output_node} unity_inverter")
+    components.append(_component_record(name, "subckt", [source_node, output_node], role="unity_inverter"))
 
 
-def emit_block_subckt(builder, layer, layer_idx, block_idx, state_capacitance):
-    block = _block_name(layer_idx, block_idx)
-    pins = _subckt_pin_list(layer, layer_idx, block_idx)
-    input_pins = pins[: layer.input_dim]
-    x0, x1 = pins[layer.input_dim :]
-    sum0 = "n_sum0"
-    sum1 = "n_sum1"
-    x0_inv = "x0_inv"
-    components = []
-
-    builder.line(f".subckt {block} {' '.join(pins)}")
-    builder.component(f"XOP_L{layer_idx}_B{block_idx}_S0", f"XOP_L{layer_idx}_B{block_idx}_S0 0 {sum0} {x0} ideal_opamp")
-    builder.component(f"XOP_L{layer_idx}_B{block_idx}_S1", f"XOP_L{layer_idx}_B{block_idx}_S1 0 {sum1} {x1} ideal_opamp")
-    builder.component(f"C_L{layer_idx}_B{block_idx}_S0", f"C_L{layer_idx}_B{block_idx}_S0 {x0} {sum0} {{CSTATE}}")
-    builder.component(f"C_L{layer_idx}_B{block_idx}_S1", f"C_L{layer_idx}_B{block_idx}_S1 {x1} {sum1} {{CSTATE}}")
+def add_integrator_state(builder, components, layer_idx, block_idx, state_idx, state_node, sum_node, state_capacitance):
+    op_name = f"XOP_L{layer_idx}_B{block_idx}_S{state_idx}"
+    cap_name = f"C_L{layer_idx}_B{block_idx}_S{state_idx}"
+    builder.component(op_name, f"{op_name} 0 {sum_node} {state_node} ideal_opamp")
+    builder.component(cap_name, f"{cap_name} {state_node} {sum_node} {{CSTATE}}")
     components.extend(
         [
-            _component_record(f"XOP_L{layer_idx}_B{block_idx}_S0", "opamp", ["0", sum0, x0], role="state_integrator"),
-            _component_record(f"XOP_L{layer_idx}_B{block_idx}_S1", "opamp", ["0", sum1, x1], role="state_integrator"),
-            _component_record(f"C_L{layer_idx}_B{block_idx}_S0", "capacitor", [x0, sum0], state_capacitance, role="state_capacitor"),
-            _component_record(f"C_L{layer_idx}_B{block_idx}_S1", "capacitor", [x1, sum1], state_capacitance, role="state_capacitor"),
+            _component_record(op_name, "opamp", ["0", sum_node, state_node], role="state_integrator"),
+            _component_record(cap_name, "capacitor", [state_node, sum_node], state_capacitance, role="state_capacitor"),
         ]
     )
 
-    builder.component(f"XINV_L{layer_idx}_B{block_idx}", f"XINV_L{layer_idx}_B{block_idx} {x0} {x0_inv} unity_inverter")
-    components.append(_component_record(f"XINV_L{layer_idx}_B{block_idx}", "subckt", [x0, x0_inv], role="unity_inverter"))
 
-    for state_idx, (state_node, sum_node) in enumerate(((x0, sum0), (x1, sum1))):
-        gain = layer.A_tr[block_idx, state_idx, state_idx]
-        resistor = resistance_for_gain(gain, state_capacitance)
-        if resistor is not None:
-            name = f"R_L{layer_idx}_B{block_idx}_alpha{state_idx}"
-            builder.component(name, f"{name} {state_node} {sum_node} {format_spice_value(resistor)}")
-            components.append(
-                _component_record(
-                    name,
-                    "resistor",
-                    [state_node, sum_node],
-                    resistor,
-                    role="state_decay",
-                    coefficient=float(gain),
-                )
-            )
+def add_gain_resistor(builder, components, name, source_node, sum_node, gain, state_capacitance, role, **extra):
+    resistor = resistance_for_gain(gain, state_capacitance)
+    if resistor is None:
+        return False
+    builder.component(name, f"{name} {source_node} {sum_node} {format_spice_value(resistor)}")
+    components.append(
+        _component_record(
+            name,
+            "resistor",
+            [source_node, sum_node],
+            resistor,
+            role=role,
+            coefficient=float(gain),
+            **extra,
+        )
+    )
+    return True
 
-    cross_specs = [
-        (0, 1, layer.A_tr[block_idx, 0, 1], x1, sum0),
-        (1, 0, layer.A_tr[block_idx, 1, 0], x0, sum1),
-    ]
-    for target_state, source_state, gain, source_node, sum_node in cross_specs:
-        resistor = resistance_for_gain(gain, state_capacitance)
-        if resistor is None:
-            continue
-        actual_source = source_node
-        polarity = "direct"
-        if gain > 0 and source_node == x0:
-            actual_source = x0_inv
-            polarity = "inverted_by_block_inverter"
-        elif gain > 0:
-            actual_source, polarity = source_for_integrator_gain(
-                layer_idx, block_idx, target_state, gain, source_node
-            )
-            inv_name = f"XINV_L{layer_idx}_B{block_idx}_cross{source_state}_{target_state}"
-            builder.component(inv_name, f"{inv_name} {source_node} {actual_source} unity_inverter")
-            components.append(_component_record(inv_name, "subckt", [source_node, actual_source], role="unity_inverter"))
-        name = f"R_L{layer_idx}_B{block_idx}_omega{source_state}_to_{target_state}"
-        builder.component(name, f"{name} {actual_source} {sum_node} {format_spice_value(resistor)}")
-        components.append(
-            _component_record(
-                name,
-                "resistor",
-                [actual_source, sum_node],
-                resistor,
-                role="cross_coupling",
-                coefficient=float(gain),
-                polarity=polarity,
-            )
+
+def emit_block_subckt(builder, layer, layer_idx, block_idx, state_capacitance):
+    block = _layer_block_name(layer, layer_idx, block_idx)
+    pins = _subckt_pin_list(layer, layer_idx, block_idx)
+    input_pins = pins[: layer.input_dim]
+    state_pins = pins[layer.input_dim :]
+    sum_nodes = [f"n_sum{idx}" for idx in range(layer.state_width)]
+    components = []
+
+    builder.line(f".subckt {block} {' '.join(pins)}")
+    for state_idx, (state_node, sum_node) in enumerate(zip(state_pins, sum_nodes)):
+        add_integrator_state(
+            builder,
+            components,
+            layer_idx,
+            block_idx,
+            state_idx,
+            state_node,
+            sum_node,
+            state_capacitance,
         )
 
-    for state_idx, sum_node in enumerate((sum0, sum1)):
+    for state_idx, (state_node, sum_node) in enumerate(zip(state_pins, sum_nodes)):
+        gain = layer.A_tr[block_idx, state_idx, state_idx]
+        add_gain_resistor(
+            builder,
+            components,
+            f"R_L{layer_idx}_B{block_idx}_alpha{state_idx}",
+            state_node,
+            sum_node,
+            gain,
+            state_capacitance,
+            "state_decay",
+        )
+
+    if layer.state_width == 2:
+        x0, x1 = state_pins
+        cross_specs = [
+            (0, 1, layer.A_tr[block_idx, 0, 1], x1, sum_nodes[0]),
+            (1, 0, layer.A_tr[block_idx, 1, 0], x0, sum_nodes[1]),
+        ]
+        inverted_sources = {}
+        for target_state, source_state, gain, source_node, sum_node in cross_specs:
+            if resistance_for_gain(gain, state_capacitance) is None:
+                continue
+            actual_source = source_node
+            polarity = "direct"
+            if gain > 0:
+                if source_node not in inverted_sources:
+                    inv_node = f"{source_node}_inv_L{layer_idx}_B{block_idx}"
+                    inv_name = f"XINV_L{layer_idx}_B{block_idx}_cross{source_state}"
+                    add_unity_inverter(builder, components, inv_name, source_node, inv_node)
+                    inverted_sources[source_node] = inv_node
+                actual_source = inverted_sources[source_node]
+                polarity = "inverted"
+            name = f"R_L{layer_idx}_B{block_idx}_omega{source_state}_to_{target_state}"
+            add_gain_resistor(
+                builder,
+                components,
+                name,
+                actual_source,
+                sum_node,
+                gain,
+                state_capacitance,
+                "cross_coupling",
+                source_state=source_state,
+                target_state=target_state,
+                polarity=polarity,
+            )
+
+    for state_idx, sum_node in enumerate(sum_nodes):
         for input_idx, input_node in enumerate(input_pins):
             gain = layer.B_tr[block_idx, state_idx, input_idx]
-            resistor = resistance_for_gain(gain, state_capacitance)
-            if resistor is None:
+            if resistance_for_gain(gain, state_capacitance) is None:
                 continue
             actual_source = input_node
             polarity = "direct"
@@ -325,22 +394,20 @@ def emit_block_subckt(builder, layer, layer_idx, block_idx, state_capacitance):
                 actual_source = f"{input_node}_inv_B{block_idx}_S{state_idx}"
                 polarity = "inverted"
                 inv_name = f"XINV_L{layer_idx}_B{block_idx}_U{input_idx}_S{state_idx}"
-                builder.component(inv_name, f"{inv_name} {input_node} {actual_source} unity_inverter")
-                components.append(_component_record(inv_name, "subckt", [input_node, actual_source], role="unity_inverter"))
+                add_unity_inverter(builder, components, inv_name, input_node, actual_source)
             name = f"R_L{layer_idx}_B{block_idx}_B{state_idx}_{input_idx}"
-            builder.component(name, f"{name} {actual_source} {sum_node} {format_spice_value(resistor)}")
-            components.append(
-                _component_record(
-                    name,
-                    "resistor",
-                    [actual_source, sum_node],
-                    resistor,
-                    role="input_weight",
-                    coefficient=float(gain),
-                    input_index=input_idx,
-                    state_index=state_idx,
-                    polarity=polarity,
-                )
+            add_gain_resistor(
+                builder,
+                components,
+                name,
+                actual_source,
+                sum_node,
+                gain,
+                state_capacitance,
+                "input_weight",
+                input_index=input_idx,
+                state_index=state_idx,
+                polarity=polarity,
             )
 
     builder.line(f".ends {block}")
@@ -348,63 +415,9 @@ def emit_block_subckt(builder, layer, layer_idx, block_idx, state_capacitance):
     return components
 
 
-def sign_aware_resistors(weights, sources, layer_idx, output_idx, prefix):
-    neg = [(idx, abs(w), src) for idx, (w, src) in enumerate(zip(weights, sources)) if w < 0]
-    pos = [(idx, w, src) for idx, (w, src) in enumerate(zip(weights, sources)) if w > 0]
-    sum_neg = sum(w for _, w, _ in neg)
-    sum_pos = sum(w for _, w, _ in pos)
-    dummy_weight = 0.0
-    denom = 1.0 + sum_neg - sum_pos
-    if denom <= 0.0:
-        dummy_weight = -denom + DEFAULT_DUMMY_MARGIN
-        denom = DEFAULT_DUMMY_MARGIN
-
-    resistors = []
-    for idx, weight, source in neg:
-        resistors.append(
-            {
-                "source_index": idx,
-                "source": source,
-                "sign": "negative",
-                "coefficient": -float(weight),
-                "resistance": DEFAULT_FEEDBACK_RESISTANCE / weight,
-            }
-        )
-    if dummy_weight > 0.0:
-        resistors.append(
-            {
-                "source_index": None,
-                "source": "0",
-                "sign": "negative_dummy_ground",
-                "coefficient": -float(dummy_weight),
-                "resistance": DEFAULT_FEEDBACK_RESISTANCE / dummy_weight,
-            }
-        )
-    for idx, weight, source in pos:
-        resistors.append(
-            {
-                "source_index": idx,
-                "source": source,
-                "sign": "positive",
-                "coefficient": float(weight),
-                "resistance": DEFAULT_FEEDBACK_RESISTANCE * denom / weight,
-            }
-        )
-    return resistors, {
-        "sum_negative_abs": float(sum_neg + dummy_weight),
-        "sum_positive": float(sum_pos),
-        "dummy_negative_weight": float(dummy_weight),
-        "positive_denominator": float(denom),
-    }
-
-
 def emit_output_stage(builder, layer, layer_idx):
     components = []
-    state_nodes = [
-        _state_node(layer_idx, block_idx, state_idx)
-        for block_idx in range(layer.n_blocks)
-        for state_idx in range(2)
-    ]
+    state_nodes = layer.state_nodes(layer_idx)
     output_records = []
 
     for output_idx in range(layer.output_dim):
@@ -488,7 +501,7 @@ def emit_top_level_instances(builder, layers):
     builder.line("* Top-level block instances")
     for layer_idx, layer in enumerate(layers):
         for block_idx in range(layer.n_blocks):
-            block = _block_name(layer_idx, block_idx)
+            block = _layer_block_name(layer, layer_idx, block_idx)
             pins = _subckt_pin_list(layer, layer_idx, block_idx)
             name = f"X_L{layer_idx}_B{block_idx}"
             builder.component(name, f"{name} {' '.join(pins)} {block}")
@@ -516,6 +529,8 @@ def build_netlist(params, ssm_param, sample_rate, state_capacitance=1e-6):
         layer_record = {
             "index": layer_idx,
             "path": layer.path,
+            "state_width": layer.state_width,
+            "state_dim": layer.state_dim,
             "input_dim": layer.input_dim,
             "output_dim": layer.output_dim,
             "n_blocks": layer.n_blocks,
@@ -535,10 +550,10 @@ def build_netlist(params, ssm_param, sample_rate, state_capacitance=1e-6):
             layer_record["blocks"].append(
                 {
                     "index": block_idx,
-                    "subckt": _block_name(layer_idx, block_idx),
+                    "subckt": _layer_block_name(layer, layer_idx, block_idx),
                     "state_nodes": [
-                        _state_node(layer_idx, block_idx, 0),
-                        _state_node(layer_idx, block_idx, 1),
+                        _state_node(layer_idx, block_idx, state_idx)
+                        for state_idx in range(layer.state_width)
                     ],
                     "components": components,
                 }

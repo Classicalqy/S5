@@ -23,16 +23,17 @@ from .export_netlist import (
 
 
 def layer_state_matrix(layer):
-    state_dim = 2 * layer.n_blocks
+    state_dim = layer.state_dim
     A = np.zeros((state_dim, state_dim), dtype=np.float64)
     for block_idx in range(layer.n_blocks):
-        start = 2 * block_idx
-        A[start:start + 2, start:start + 2] = layer.A_tr[block_idx]
+        start = layer.state_width * block_idx
+        stop = start + layer.state_width
+        A[start:stop, start:stop] = layer.A_tr[block_idx]
     return A
 
 
 def layer_input_matrix(layer):
-    return layer.B_tr.reshape((2 * layer.n_blocks, layer.input_dim))
+    return layer.B_tr.reshape((layer.state_dim, layer.input_dim))
 
 
 def make_stimulus(times, input_dim, kind="sine", amplitude=0.1):
@@ -98,15 +99,15 @@ def simulate_layer_reference(layer, times, inputs):
     return states, outputs
 
 
-def write_reference_csv(path, times, inputs, states, outputs, layer_index):
+def write_reference_csv(path, times, inputs, states, outputs, layer_index, state_width=2):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     headers = ["time"]
     headers.extend(_input_node(layer_index, idx) for idx in range(inputs.shape[1]))
     headers.extend(
         _state_node(layer_index, block_idx, state_idx)
-        for block_idx in range(states.shape[1] // 2)
-        for state_idx in range(2)
+        for block_idx in range(states.shape[1] // state_width)
+        for state_idx in range(state_width)
     )
     headers.extend(_output_node(layer_index, idx) for idx in range(outputs.shape[1]))
     with path.open("w", newline="") as handle:
@@ -156,7 +157,7 @@ def write_validation_deck(
     save_nodes.extend(
         _state_node(layer_index, block_idx, state_idx)
         for block_idx in range(layer.n_blocks)
-        for state_idx in range(2)
+        for state_idx in range(layer.state_width)
     )
     save_nodes.extend(_output_node(layer_index, idx) for idx in range(layer.output_dim))
 
@@ -171,7 +172,7 @@ def write_validation_deck(
             )
         )
     for block_idx in range(layer.n_blocks):
-        for state_idx in range(2):
+        for state_idx in range(layer.state_width):
             lines.append(f".ic V({_state_node(layer_index, block_idx, state_idx)})=0")
     lines.append(".options plotwinsize=0")
     lines.append(".save " + " ".join(f"V({node})" for node in save_nodes))
@@ -216,6 +217,7 @@ def generate_validation_artifacts(
         states,
         outputs,
         layer_index,
+        state_width=layer.state_width,
     )
     deck_path, save_nodes = write_validation_deck(
         cir_path,

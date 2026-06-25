@@ -1,7 +1,7 @@
 # LTSpice Export For Hardware-Friendly S5 Layers
 
 This package exports trained hardware-friendly S5 SSM layers to LTSpice netlists.
-The layer exporter supports only `resonant_2x2` and `energy_shaped_2x2`
+The layer exporter supports `real_decay`, `resonant_2x2`, and `energy_shaped_2x2`
 `RealValuedSSM` modules. Dense encoder/decoder layers, normalization,
 residual paths, dropout, GLU/GELU activations, and classifier heads are skipped
 by the layer-only exporter.
@@ -11,7 +11,7 @@ by the layer-only exporter.
 ```bash
 python -m spice.export_netlist \
   --params model.msgpack \
-  --ssm-param resonant_2x2 \
+  --ssm-param real_decay \
   --sample-rate 16000 \
   --out out/model.cir
 ```
@@ -29,7 +29,13 @@ The command writes:
 For each SSM module, the exporter recursively looks for:
 
 ```text
-B, C, raw_alpha, omega, log_step
+B, C, raw_alpha, log_step
+```
+
+and, for the 2x2 modes, also:
+
+```text
+omega
 ```
 
 and, for `energy_shaped_2x2`, also:
@@ -41,10 +47,16 @@ raw_q
 The continuous-time parameters are reconstructed as:
 
 ```text
+Delta = exp(log_step[:, 0])
 alpha = softplus(raw_alpha) + 1e-4
+
+# real_decay
+A_i = [-alpha_i]
+B_tr,i = sample_rate * Delta_i * B_i
+
+# resonant_2x2 / energy_shaped_2x2
 q = softplus(raw_q) + 1e-4       # energy_shaped_2x2 only
 q = 1                            # resonant_2x2
-Delta = exp(log_step[:, 0])
 
 A_k = q_k [[-alpha_k, -omega_k],
            [ omega_k, -alpha_k]]
@@ -66,7 +78,9 @@ The default state capacitor is `1uF`, configurable with
 
 ## Circuit Shape
 
-Each 2x2 block is emitted as a named subcircuit with:
+Each `real_decay` state is emitted as a one-state active low-pass/integrator
+subcircuit with a decay resistor and input-weight resistors. Each 2x2 block is
+emitted as a named subcircuit with:
 
 - two ideal-op-amp active low-pass/integrator states,
 - one unity inverter for the positive cross-coupling branch,
@@ -126,11 +140,11 @@ The workflow writes:
 - `layer_sanity/summary.json` plus per-layer Python reference CSV, LTSpice
   deck, rRMSE metrics, and state overlay PNGs,
 - `full_alignment/summary.json`, per-sample digital/continuous references,
-  per-layer state/output rRMSE tables, and per-sample plots for each layer's
-  worst two states, first-block states, and final logits when LTSpice `.raw`
-  files are present,
+  per-layer state/output rRMSE tables, and per-sample plots for combined
+  first-block states, combined per-layer worst states, and final logits when
+  LTSpice `.raw` files are present,
 - `accuracy/summary.json` and `accuracy/per_sample.csv` for logit-only test-set
-  accuracy.
+  accuracy plus digital/LTSpice margin analysis.
 
 Use `--no-run-ltspice` to only generate netlists, decks, references, and pending
 summaries. Re-running the same command with the same `--out-dir` resumes

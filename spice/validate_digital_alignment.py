@@ -11,7 +11,7 @@ import numpy as np
 from scipy.integrate import solve_ivp
 
 from s5.dataloading import Datasets
-from s5.ssm_parameterizations import discretize_2x2_blocks
+from s5.ssm_parameterizations import discretize_2x2_blocks, discretize_real_decay
 
 from .compare_transient import canonical_column, read_trace_table
 from .export_full_model import extract_full_model
@@ -21,7 +21,24 @@ from .trace_utils import full_model_nodes, linear_nodes, write_trace_csv, zoh_pw
 from .validate_transient import layer_input_matrix, layer_state_matrix, strip_final_end
 
 
+def _state_node_for_flat_index(layer_idx, layer, state_idx):
+    return _state_node(
+        layer_idx,
+        state_idx // layer.state_width,
+        state_idx % layer.state_width,
+    )
+
+
 def layer_discrete_matrices(layer):
+    if layer.state_width == 1:
+        Lambda_bar, B_bar = discretize_real_decay(
+            layer.alpha,
+            layer.B,
+            layer.delta,
+            "zoh",
+        )
+        return np.asarray(Lambda_bar, dtype=np.float64), np.asarray(B_bar, dtype=np.float64)
+
     B_blocks = layer.B.reshape((layer.n_blocks, 2, layer.input_dim))
     A_bar, B_bar = discretize_2x2_blocks(
         layer.q * layer.alpha,
@@ -35,14 +52,21 @@ def layer_discrete_matrices(layer):
 
 def simulate_layer_digital(layer, inputs):
     A_bar, B_bar = layer_discrete_matrices(layer)
-    state = np.zeros((layer.n_blocks, 2), dtype=np.float64)
-    states = np.zeros((inputs.shape[0], 2 * layer.n_blocks), dtype=np.float64)
+    states = np.zeros((inputs.shape[0], layer.state_dim), dtype=np.float64)
     outputs = np.zeros((inputs.shape[0], layer.output_dim), dtype=np.float64)
-    for idx, current in enumerate(inputs):
-        state = np.einsum("kij,kj->ki", A_bar, state) + np.einsum("kih,h->ki", B_bar, current)
-        flat = state.reshape(-1)
-        states[idx] = flat
-        outputs[idx] = layer.C @ flat
+    if layer.state_width == 1:
+        state = np.zeros((layer.n_blocks,), dtype=np.float64)
+        for idx, current in enumerate(inputs):
+            state = A_bar * state + B_bar @ current
+            states[idx] = state
+            outputs[idx] = layer.C @ state
+    else:
+        state = np.zeros((layer.n_blocks, 2), dtype=np.float64)
+        for idx, current in enumerate(inputs):
+            state = np.einsum("kij,kj->ki", A_bar, state) + np.einsum("kih,h->ki", B_bar, current)
+            flat = state.reshape(-1)
+            states[idx] = flat
+            outputs[idx] = layer.C @ flat
     return states, outputs
 
 
@@ -55,7 +79,7 @@ def simulate_full_digital(model, inputs, sample_rate):
     for layer_idx, layer in enumerate(model.ssm_layers):
         states, outputs = simulate_layer_digital(layer, current)
         for state_idx in range(states.shape[1]):
-            traces[_state_node(layer_idx, state_idx // 2, state_idx % 2)] = states[:, state_idx]
+            traces[_state_node_for_flat_index(layer_idx, layer, state_idx)] = states[:, state_idx]
         for out_idx, node in enumerate(linear_nodes(f"L{layer_idx}_out", layer.output_dim)):
             traces[node] = outputs[:, out_idx]
         current = np.maximum(outputs, 0.0)
@@ -72,7 +96,7 @@ def simulate_full_continuous_zoh(model, inputs, sample_rate):
     sample_rate = float(sample_rate)
     dt = 1.0 / sample_rate
     times = zoh_sample_times(inputs.shape[0], sample_rate)
-    state_sizes = [2 * layer.n_blocks for layer in model.ssm_layers]
+    state_sizes = [layer.state_dim for layer in model.ssm_layers]
     offsets = np.cumsum([0] + state_sizes)
     As = [layer_state_matrix(layer) for layer in model.ssm_layers]
     Bs = [layer_input_matrix(layer) for layer in model.ssm_layers]
@@ -110,7 +134,7 @@ def simulate_full_continuous_zoh(model, inputs, sample_rate):
     for layer_idx, layer in enumerate(model.ssm_layers):
         layer_states = states[:, offsets[layer_idx]:offsets[layer_idx + 1]]
         for state_idx in range(layer_states.shape[1]):
-            traces[_state_node(layer_idx, state_idx // 2, state_idx % 2)] = layer_states[:, state_idx]
+            traces[_state_node_for_flat_index(layer_idx, layer, state_idx)] = layer_states[:, state_idx]
         outputs = layer_states @ layer.C.T
         for out_idx, node in enumerate(linear_nodes(f"L{layer_idx}_out", layer.output_dim)):
             traces[node] = outputs[:, out_idx]
@@ -161,7 +185,7 @@ def write_sample_deck(base_cir_path, out_path, inputs, model, sample_rate):
     lines.append(zoh_pwl_source_line("VSTIM_IN0", "IN0", dt, inputs[:, 0]))
     for layer_idx, layer in enumerate(model.ssm_layers):
         for block_idx in range(layer.n_blocks):
-            for state_idx in range(2):
+            for state_idx in range(layer.state_width):
                 lines.append(f".ic V({_state_node(layer_idx, block_idx, state_idx)})=0")
     lines.append(".options plotwinsize=0")
     lines.append(".save " + " ".join(f"V({node})" for node in save_nodes))

@@ -24,6 +24,80 @@ LOGIT_MAX_ABS_FIELD = "ltspice_vs_digital_final_logit_max_abs"
 LOGIT_RMSE_FIELD = "ltspice_vs_digital_final_logit_rmse"
 OLD_LOGIT_MAX_ABS_FIELD = "final_logit_max_abs"
 OLD_LOGIT_RMSE_FIELD = "final_logit_rmse"
+MARGIN_FIELDS = [
+    "digital_margin",
+    "ltspice_margin",
+    "min_margin",
+    "agreement_bucket",
+    "pred_disagreement",
+]
+
+
+def logit_margin(logits):
+    logits = np.asarray(logits, dtype=np.float64)
+    if logits.shape[0] < 2:
+        return 0.0
+    top = np.sort(logits)[-2:]
+    return float(top[1] - top[0])
+
+
+def _as_float(value):
+    return None if value in {None, ""} else float(value)
+
+
+def agreement_bucket(digital_pred, ltspice_pred, label):
+    digital_ok = int(digital_pred) == int(label)
+    ltspice_ok = int(ltspice_pred) == int(label)
+    if digital_ok and ltspice_ok:
+        return "correct_correct"
+    if digital_ok and not ltspice_ok:
+        return "correct_wrong"
+    if not digital_ok and ltspice_ok:
+        return "wrong_correct"
+    return "wrong_wrong"
+
+
+def _logits_from_row(row, prefix, n_classes):
+    if n_classes <= 0:
+        return None
+    values = []
+    for idx in range(n_classes):
+        value = row.get(f"{prefix}_logit{idx}", "")
+        if value == "":
+            return None
+        values.append(float(value))
+    return np.asarray(values, dtype=np.float64)
+
+
+def _infer_n_classes(rows):
+    max_idx = -1
+    for row in rows.values():
+        for key in row:
+            if key.startswith("digital_logit"):
+                suffix = key.removeprefix("digital_logit")
+                if suffix.isdigit():
+                    max_idx = max(max_idx, int(suffix))
+    return max_idx + 1
+
+
+def _ensure_margin_fields(row, n_classes):
+    digital_logits = _logits_from_row(row, "digital", n_classes)
+    ltspice_logits = _logits_from_row(row, "ltspice", n_classes)
+    if row.get("digital_margin", "") == "" and digital_logits is not None:
+        row["digital_margin"] = format_spice_value(logit_margin(digital_logits))
+    if row.get("ltspice_margin", "") == "" and ltspice_logits is not None:
+        row["ltspice_margin"] = format_spice_value(logit_margin(ltspice_logits))
+    if row.get("min_margin", "") == "" and row.get("digital_margin", "") != "" and row.get("ltspice_margin", "") != "":
+        row["min_margin"] = format_spice_value(min(float(row["digital_margin"]), float(row["ltspice_margin"])))
+
+    complete = row.get("status") == "complete"
+    has_preds = row.get("digital_pred", "") != "" and row.get("ltspice_pred", "") != "" and row.get("label", "") != ""
+    if complete and has_preds:
+        if row.get("agreement_bucket", "") == "":
+            row["agreement_bucket"] = agreement_bucket(row["digital_pred"], row["ltspice_pred"], row["label"])
+        if row.get("pred_disagreement", "") == "":
+            row["pred_disagreement"] = int(_as_int(row["digital_pred"]) != _as_int(row["ltspice_pred"]))
+    return row
 
 
 def final_logits_from_digital(model, inputs, sample_rate):
@@ -63,7 +137,7 @@ def write_logit_only_deck(base_cir_path, out_path, inputs, model, sample_rate, m
     lines.append(zoh_pwl_source_line("VSTIM_IN0", "IN0", dt, inputs[:, 0]))
     for layer_idx, layer in enumerate(model.ssm_layers):
         for block_idx in range(layer.n_blocks):
-            for state_idx in range(2):
+            for state_idx in range(layer.state_width):
                 lines.append(f".ic V({_state_node(layer_idx, block_idx, state_idx)})=0")
     lines.append(".options plotwinsize=0")
     lines.append(".save " + " ".join(f"V({node})" for node in logit_nodes))
@@ -104,6 +178,7 @@ def write_rows(path, rows, n_classes):
         "status",
         LOGIT_MAX_ABS_FIELD,
         LOGIT_RMSE_FIELD,
+        *MARGIN_FIELDS,
         "error",
         "deck",
         "raw",
@@ -114,6 +189,7 @@ def write_rows(path, rows, n_classes):
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for sample_idx in sorted(rows):
+            _ensure_margin_fields(rows[sample_idx], n_classes)
             writer.writerow({field: rows[sample_idx].get(field, "") for field in fields})
 
 
@@ -121,7 +197,64 @@ def _as_int(value):
     return None if value in {None, ""} else int(value)
 
 
+def _margin_distribution(rows):
+    margins = [_as_float(row.get("digital_margin", "")) for row in rows]
+    margins = [value for value in margins if value is not None]
+    if not margins:
+        return {"count": 0, "mean_digital_margin": None, "median_digital_margin": None}
+    return {
+        "count": len(margins),
+        "mean_digital_margin": float(np.mean(margins)),
+        "median_digital_margin": float(np.median(margins)),
+    }
+
+
+def build_margin_analysis(rows, n_classes):
+    for row in rows.values():
+        _ensure_margin_fields(row, n_classes)
+    complete = [row for row in rows.values() if row.get("status") == "complete"]
+    buckets = {}
+    for bucket in ("correct_correct", "correct_wrong", "wrong_correct", "wrong_wrong"):
+        bucket_rows = [row for row in complete if row.get("agreement_bucket") == bucket]
+        stats = _margin_distribution(bucket_rows)
+        stats["rate"] = float(len(bucket_rows) / len(complete)) if complete else None
+        buckets[bucket] = stats
+
+    agreement_rows = [row for row in complete if str(row.get("pred_disagreement", "")) in {"0", "False", "false"}]
+    disagreement_rows = [row for row in complete if str(row.get("pred_disagreement", "")) in {"1", "True", "true"}]
+    margins = [_as_float(row.get("digital_margin", "")) for row in complete]
+    margins = [value for value in margins if value is not None]
+    threshold = float(np.quantile(margins, 0.25)) if margins else None
+    low_margin_rows = [
+        row
+        for row in complete
+        if threshold is not None
+        and _as_float(row.get("digital_margin", "")) is not None
+        and _as_float(row.get("digital_margin", "")) <= threshold
+    ]
+    low_margin_disagreements = [
+        row for row in low_margin_rows if str(row.get("pred_disagreement", "")) in {"1", "True", "true"}
+    ]
+    return {
+        "bucket_stats": buckets,
+        "agreement_margin": _margin_distribution(agreement_rows),
+        "disagreement_margin": _margin_distribution(disagreement_rows),
+        "low_margin": {
+            "definition": "digital_margin <= completed-sample 25th percentile",
+            "digital_margin_threshold": threshold,
+            "count": len(low_margin_rows),
+            "disagreement_rate": (
+                float(len(low_margin_disagreements) / len(low_margin_rows)) if low_margin_rows else None
+            ),
+            "disagreement_low_margin_fraction": (
+                float(len(low_margin_disagreements) / len(disagreement_rows)) if disagreement_rows else None
+            ),
+        },
+    }
+
+
 def build_summary(rows, num_samples):
+    n_classes = _infer_n_classes(rows)
     complete = [row for row in rows.values() if row.get("status") == "complete"]
     digital_rows = [row for row in rows.values() if row.get("digital_pred", "") != ""]
     digital_correct = [
@@ -149,6 +282,7 @@ def build_summary(rows, num_samples):
         ),
         "ltspice_vs_digital_final_logit_max_abs": max(max_abs) if max_abs else None,
         "ltspice_vs_digital_final_logit_rmse_mean": float(np.mean(rmses)) if rmses else None,
+        "margin_analysis": build_margin_analysis(rows, n_classes),
         "status": "complete" if len(complete) == num_samples else "pending",
     }
 
@@ -196,6 +330,7 @@ def run_accuracy_sample(
         "sample": sample_idx,
         "label": int(label),
         "digital_pred": int(np.argmax(digital_logits)),
+        "digital_margin": format_spice_value(logit_margin(digital_logits)),
         "status": "pending",
         "deck": str(deck_path),
         "raw": str(raw_path),
@@ -222,6 +357,10 @@ def run_accuracy_sample(
                 "status": "complete",
                 LOGIT_MAX_ABS_FIELD: format_spice_value(np.max(np.abs(diff))),
                 LOGIT_RMSE_FIELD: format_spice_value(np.sqrt(np.mean(diff ** 2))),
+                "ltspice_margin": format_spice_value(logit_margin(ltspice_logits)),
+                "min_margin": format_spice_value(min(logit_margin(digital_logits), logit_margin(ltspice_logits))),
+                "agreement_bucket": agreement_bucket(int(np.argmax(digital_logits)), int(np.argmax(ltspice_logits)), label),
+                "pred_disagreement": int(np.argmax(digital_logits) != np.argmax(ltspice_logits)),
             }
         )
         row.update({f"ltspice_logit{i}": format_spice_value(value) for i, value in enumerate(ltspice_logits)})

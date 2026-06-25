@@ -7,7 +7,7 @@ import pytest
 from flax.serialization import to_bytes
 
 from s5.train import save_params_msgpack
-from s5.ssm_parameterizations import discretize_2x2_blocks, init_RealValuedSSM
+from s5.ssm_parameterizations import discretize_2x2_blocks, discretize_real_decay, init_RealValuedSSM
 import spice.workflow as spice_workflow
 from spice.compare_transient import compare_traces
 from spice.export_full_model import (
@@ -31,7 +31,7 @@ from spice.validate_digital_alignment import (
     simulate_full_continuous_zoh,
     simulate_full_digital,
 )
-from spice.validate_ltspice_accuracy import validate_ltspice_accuracy, write_logit_only_deck
+from spice.validate_ltspice_accuracy import build_margin_analysis, validate_ltspice_accuracy, write_logit_only_deck
 from spice.validate_transient import generate_validation_artifacts, make_stimulus, simulate_layer_reference
 from spice.workflow import run_workflow
 
@@ -62,15 +62,15 @@ def _nested_params(module):
     }
 
 
-def _full_model_params():
+def _full_model_params(ssm_param="resonant_2x2"):
     return {
         "encoder": {
             "encoder": {
                 "kernel": np.array([[0.5, -0.25]], dtype=np.float32),
                 "bias": np.array([0.1, -0.2], dtype=np.float32),
             },
-            "layers_0": {"seq": _single_ssm_params(H=2, P=4)},
-            "layers_1": {"seq": _single_ssm_params(H=2, P=4)},
+            "layers_0": {"seq": _single_ssm_params(ssm_param=ssm_param, H=2, P=4)},
+            "layers_1": {"seq": _single_ssm_params(ssm_param=ssm_param, H=2, P=4)},
         },
         "decoder": {
             "kernel": np.array([[0.2, -0.3, 0.1], [-0.4, 0.5, -0.6]], dtype=np.float32),
@@ -135,6 +135,24 @@ def test_module_to_layer_maps_energy_shaped_q():
     )
 
 
+def test_module_to_layer_maps_real_decay_values():
+    module = {
+        "B": np.array([[1.0, -2.0], [0.0, 3.0]], dtype=np.float32),
+        "C": np.array([[1.0, 0.0], [0.5, -0.25]], dtype=np.float32),
+        "raw_alpha": np.array([0.0, 1.0], dtype=np.float32),
+        "log_step": np.array([[math.log(0.25)], [math.log(0.5)]], dtype=np.float32),
+    }
+
+    layer = module_to_layer("seq", module, "real_decay", sample_rate=100.0)
+
+    alpha = positive(np.array([0.0, 1.0]))
+    np.testing.assert_allclose(layer.A_tr[:, 0, 0], 100.0 * np.array([0.25, 0.5]) * -alpha, rtol=1e-6)
+    np.testing.assert_allclose(layer.B_tr[:, 0, :], 100.0 * np.array([[0.25], [0.5]]) * module["B"], rtol=1e-6)
+    assert layer.state_width == 1
+    assert layer.state_dim == 2
+    np.testing.assert_allclose(layer.C, module["C"], rtol=1e-6)
+
+
 def test_netlist_skips_zero_weight_resistors_and_has_positive_values():
     module = {
         "B": np.array([[1.0, 0.0], [0.0, -2.0]], dtype=np.float32),
@@ -163,6 +181,29 @@ def test_netlist_skips_zero_weight_resistors_and_has_positive_values():
     assert all(c["value"] > 0 for c in components if c["kind"] in {"resistor", "capacitor"})
     assert "R_L0_B0_B0_1" not in netlist
     assert "R_L0_B0_B1_0" not in netlist
+
+
+def test_real_decay_netlist_uses_single_state_blocks_without_cross_coupling():
+    module = {
+        "B": np.array([[1.0, 0.0], [0.0, -2.0]], dtype=np.float32),
+        "C": np.array([[0.0, 1.5], [-0.5, 0.0]], dtype=np.float32),
+        "raw_alpha": np.array([0.0, 1.0], dtype=np.float32),
+        "log_step": np.array([[0.0], [math.log(0.5)]], dtype=np.float32),
+    }
+
+    netlist, manifest = build_netlist(
+        _nested_params(module),
+        ssm_param="real_decay",
+        sample_rate=1.0,
+        state_capacitance=1e-6,
+    )
+
+    layer = manifest["layers"][0]
+    assert ".subckt s5_L0_B0_real_decay" in netlist
+    assert "omega" not in netlist
+    assert layer["state_width"] == 1
+    assert layer["blocks"][0]["state_nodes"] == ["L0_B0_x0"]
+    assert not [c for c in layer["components"] if c.get("role") == "cross_coupling"]
 
 
 def test_netlist_smoke_contains_expected_block_parts_and_unique_ids():
@@ -211,7 +252,7 @@ def test_python_reference_has_expected_shapes():
 
     states, outputs = simulate_layer_reference(layer, times, inputs)
 
-    assert states.shape == (11, 2 * layer.n_blocks)
+    assert states.shape == (11, layer.state_dim)
     assert outputs.shape == (11, layer.output_dim)
     np.testing.assert_allclose(states[0], 0.0)
     np.testing.assert_allclose(outputs[0], 0.0)
@@ -368,6 +409,22 @@ def test_digital_discrete_matrices_match_training_zoh_discretizer():
     np.testing.assert_allclose(B_bar, np.asarray(expected_B), rtol=1e-6)
 
 
+def test_real_decay_digital_discrete_matrices_match_training_zoh_discretizer():
+    model = extract_full_model(_full_model_params("real_decay"), "real_decay", sample_rate=10.0)
+    layer = model.ssm_layers[0]
+
+    Lambda_bar, B_bar = layer_discrete_matrices(layer)
+    expected_Lambda, expected_B = discretize_real_decay(
+        layer.alpha,
+        layer.B,
+        layer.delta,
+        "zoh",
+    )
+
+    np.testing.assert_allclose(Lambda_bar, np.asarray(expected_Lambda), rtol=1e-6)
+    np.testing.assert_allclose(B_bar, np.asarray(expected_B), rtol=1e-6)
+
+
 def test_full_model_digital_and_continuous_alignment_shapes():
     model = extract_full_model(_full_model_params(), "resonant_2x2", sample_rate=10.0)
     inputs = np.linspace(0.0, 0.2, 5, dtype=np.float64)[:, None]
@@ -378,6 +435,20 @@ def test_full_model_digital_and_continuous_alignment_shapes():
     assert digital["LOGIT0"].shape == (5,)
     assert continuous["LOGIT0"].shape == (5,)
     assert digital["L0_out0"].shape == (5,)
+    np.testing.assert_allclose(digital["time"], np.arange(1, 6) / 10.0)
+
+
+def test_real_decay_full_model_digital_and_continuous_alignment_shapes():
+    model = extract_full_model(_full_model_params("real_decay"), "real_decay", sample_rate=10.0)
+    inputs = np.linspace(0.0, 0.2, 5, dtype=np.float64)[:, None]
+
+    digital = simulate_full_digital(model, inputs, sample_rate=10.0)
+    continuous = simulate_full_continuous_zoh(model, inputs, sample_rate=10.0)
+
+    assert digital["LOGIT0"].shape == (5,)
+    assert continuous["LOGIT0"].shape == (5,)
+    assert "L0_B0_x0" in digital
+    assert "L0_B0_x1" not in digital
     np.testing.assert_allclose(digital["time"], np.arange(1, 6) / 10.0)
 
 
@@ -454,8 +525,76 @@ def test_ltspice_accuracy_no_run_writes_pending_summary(tmp_path):
     assert summary["comparison_semantics"] == "ltspice_continuous_cascade_vs_digital_stacked_recurrence"
     assert "ltspice_vs_digital_final_logit_max_abs" in summary
     assert "final_logit_max_abs" not in summary
+    assert "margin_analysis" in summary
+    assert "digital_margin" in (tmp_path / "accuracy" / "per_sample.csv").read_text()
     assert (tmp_path / "accuracy" / "sample_00000" / "sample_00000.cir").exists()
     assert (tmp_path / "accuracy" / "per_sample.csv").exists()
+
+
+def test_margin_analysis_reports_buckets_and_low_margin_concentration():
+    rows = {
+        0: {
+            "sample": 0,
+            "label": 0,
+            "digital_pred": 0,
+            "ltspice_pred": 1,
+            "status": "complete",
+            "digital_logit0": "1.0",
+            "digital_logit1": "0.9",
+            "digital_logit2": "0.0",
+            "ltspice_logit0": "0.8",
+            "ltspice_logit1": "1.0",
+            "ltspice_logit2": "0.0",
+        },
+        1: {
+            "sample": 1,
+            "label": 0,
+            "digital_pred": 0,
+            "ltspice_pred": 0,
+            "status": "complete",
+            "digital_logit0": "1.0",
+            "digital_logit1": "0.0",
+            "digital_logit2": "0.0",
+            "ltspice_logit0": "1.0",
+            "ltspice_logit1": "0.0",
+            "ltspice_logit2": "0.0",
+        },
+        2: {
+            "sample": 2,
+            "label": 0,
+            "digital_pred": 1,
+            "ltspice_pred": 0,
+            "status": "complete",
+            "digital_logit0": "0.8",
+            "digital_logit1": "1.0",
+            "digital_logit2": "0.0",
+            "ltspice_logit0": "1.0",
+            "ltspice_logit1": "0.0",
+            "ltspice_logit2": "0.0",
+        },
+        3: {
+            "sample": 3,
+            "label": 0,
+            "digital_pred": 1,
+            "ltspice_pred": 2,
+            "status": "complete",
+            "digital_logit0": "0.0",
+            "digital_logit1": "2.0",
+            "digital_logit2": "0.0",
+            "ltspice_logit0": "0.0",
+            "ltspice_logit1": "0.0",
+            "ltspice_logit2": "2.0",
+        },
+    }
+
+    analysis = build_margin_analysis(rows, n_classes=3)
+
+    assert analysis["bucket_stats"]["correct_wrong"]["count"] == 1
+    assert analysis["bucket_stats"]["correct_correct"]["count"] == 1
+    assert analysis["bucket_stats"]["wrong_correct"]["count"] == 1
+    assert analysis["bucket_stats"]["wrong_wrong"]["count"] == 1
+    np.testing.assert_allclose(analysis["low_margin"]["disagreement_rate"], 1.0)
+    np.testing.assert_allclose(analysis["low_margin"]["disagreement_low_margin_fraction"], 1.0 / 3.0)
 
 
 def test_unified_workflow_no_run_generates_artifacts(tmp_path):

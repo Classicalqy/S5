@@ -14,7 +14,7 @@ from .export_netlist import (
     DEFAULT_FEEDBACK_RESISTANCE,
     NetlistBuilder,
     SUPPORTED_SSM_PARAMS,
-    _block_name,
+    _layer_block_name,
     _output_node,
     _state_node,
     add_model_header,
@@ -159,10 +159,13 @@ def emit_ssm_stage(builder, layer, layer_idx, input_nodes):
     for block_idx in range(layer.n_blocks):
         emit_block_subckt(builder, layer, layer_idx, block_idx, 1e-6)
     for block_idx in range(layer.n_blocks):
-        pins = input_nodes + [_state_node(layer_idx, block_idx, 0), _state_node(layer_idx, block_idx, 1)]
+        pins = input_nodes + [
+            _state_node(layer_idx, block_idx, state_idx)
+            for state_idx in range(layer.state_width)
+        ]
         builder.component(
             f"XFULL_L{layer_idx}_B{block_idx}",
-            f"XFULL_L{layer_idx}_B{block_idx} {' '.join(pins)} {_block_name(layer_idx, block_idx)}",
+            f"XFULL_L{layer_idx}_B{block_idx} {' '.join(pins)} {_layer_block_name(layer, layer_idx, block_idx)}",
         )
     emit_output_stage(builder, layer, layer_idx)
     return [_output_node(layer_idx, idx) for idx in range(layer.output_dim)]

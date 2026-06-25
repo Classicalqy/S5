@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .export_netlist import _output_node, _state_node, format_spice_value
+from .export_netlist import _output_node, format_spice_value
 
 
 def linear_nodes(prefix, count):
@@ -18,11 +18,7 @@ def full_model_nodes(model):
     nodes = ["IN0"]
     nodes.extend(linear_nodes("ENC", model.encoder_bias.shape[0]))
     for layer_idx, layer in enumerate(model.ssm_layers):
-        nodes.extend(
-            _state_node(layer_idx, block_idx, state_idx)
-            for block_idx in range(layer.n_blocks)
-            for state_idx in range(2)
-        )
+        nodes.extend(layer.state_nodes(layer_idx))
         nodes.extend(_output_node(layer_idx, idx) for idx in range(layer.output_dim))
         nodes.extend(linear_nodes(f"RELU{layer_idx}_", layer.output_dim))
     nodes.extend(linear_nodes("LOGIT", model.decoder_bias.shape[0]))

@@ -62,10 +62,11 @@ def _maybe_run_ltspice(deck_path, ltspice_bin, run_ltspice_enabled):
 
 def _layer_nodes(layer_idx, layer_manifest, role):
     if role == "state":
+        state_width = int(layer_manifest.get("state_width", 2))
         return [
             _state_node(layer_idx, block_idx, state_idx)
             for block_idx in range(layer_manifest["n_blocks"])
-            for state_idx in range(2)
+            for state_idx in range(state_width)
         ]
     if role == "output":
         return [_output_node(layer_idx, idx) for idx in range(layer_manifest["output_dim"])]
@@ -75,11 +76,7 @@ def _layer_nodes(layer_idx, layer_manifest, role):
 def _model_layer_nodes(model, layer_idx, role):
     layer = model.ssm_layers[layer_idx]
     if role == "state":
-        return [
-            _state_node(layer_idx, block_idx, state_idx)
-            for block_idx in range(layer.n_blocks)
-            for state_idx in range(2)
-        ]
+        return layer.state_nodes(layer_idx)
     if role == "output":
         return [_output_node(layer_idx, idx) for idx in range(layer.output_dim)]
     raise ValueError("role must be state or output.")
@@ -205,6 +202,9 @@ def _plot_full_alignment_sample(alignment_dir, model, sample_idx=0):
     logit_plot = sample_dir / "final_logits.png"
     plots = {}
     rrmse_rows = []
+    first_block_nodes = []
+    worst_nodes = []
+    layer_summaries = {}
     for layer_idx, _layer in enumerate(model.ssm_layers):
         layer_state_nodes = _model_layer_nodes(model, layer_idx, "state")
         layer_output_nodes = _model_layer_nodes(model, layer_idx, "output")
@@ -213,41 +213,45 @@ def _plot_full_alignment_sample(alignment_dir, model, sample_idx=0):
         rrmse_rows.extend(state_rows)
         rrmse_rows.extend(output_rows)
 
-        worst_nodes = [
+        layer_worst_nodes = [
             row["node"]
-            for row in sorted(state_rows, key=lambda row: row["rrmse"], reverse=True)[:2]
+            for row in sorted(state_rows, key=lambda row: row["rrmse"], reverse=True)[:1]
         ]
-        first_block_nodes = layer_state_nodes[:2]
-        layer_plots = {}
-        if worst_nodes:
-            worst_path = sample_dir / f"layer_{layer_idx:02d}_worst_states.png"
-            plot_trace_overlay(
-                worst_path,
-                digital["time"],
-                digital,
-                ltspice,
-                worst_nodes,
-                reference_label="digital",
-                candidate_label="ltspice",
-            )
-            layer_plots["worst_state_plot"] = _path(worst_path)
-        if first_block_nodes:
-            first_path = sample_dir / f"layer_{layer_idx:02d}_first_block_states.png"
-            plot_trace_overlay(
-                first_path,
-                digital["time"],
-                digital,
-                ltspice,
-                first_block_nodes,
-                reference_label="digital",
-                candidate_label="ltspice",
-            )
-            layer_plots["first_block_state_plot"] = _path(first_path)
-        plots[f"layer_{layer_idx:02d}"] = {
-            "worst_state_nodes": worst_nodes,
-            "first_block_state_nodes": first_block_nodes,
-            **layer_plots,
+        layer_first_block_nodes = layer_state_nodes[: _layer.state_width]
+        worst_nodes.extend(layer_worst_nodes)
+        first_block_nodes.extend(layer_first_block_nodes)
+        layer_summaries[f"layer_{layer_idx:02d}"] = {
+            "worst_state_nodes": layer_worst_nodes,
+            "first_block_state_nodes": layer_first_block_nodes,
         }
+
+    if worst_nodes:
+        worst_path = sample_dir / "worst_states.png"
+        plot_trace_overlay(
+            worst_path,
+            digital["time"],
+            digital,
+            ltspice,
+            worst_nodes,
+            reference_label="digital",
+            candidate_label="ltspice",
+        )
+        plots["worst_state_plot"] = _path(worst_path)
+    if first_block_nodes:
+        first_path = sample_dir / "first_block_states.png"
+        plot_trace_overlay(
+            first_path,
+            digital["time"],
+            digital,
+            ltspice,
+            first_block_nodes,
+            reference_label="digital",
+            candidate_label="ltspice",
+        )
+        plots["first_block_state_plot"] = _path(first_path)
+    plots["worst_state_nodes"] = worst_nodes
+    plots["first_block_state_nodes"] = first_block_nodes
+    plots["layers"] = layer_summaries
 
     plot_logit_bar(
         logit_plot,
