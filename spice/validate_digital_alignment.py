@@ -176,6 +176,11 @@ def read_ltspice_trace(raw_path, times, nodes):
     return traces
 
 
+def trace_file_ready(path):
+    path = Path(path)
+    return path.exists() and path.stat().st_size > 0
+
+
 def write_sample_deck(base_cir_path, out_path, inputs, model, sample_rate):
     body = strip_final_end(Path(base_cir_path).read_text())
     dt = 1.0 / float(sample_rate)
@@ -372,35 +377,40 @@ def generate_digital_alignment_artifacts(
 
         raw_path = deck_path.with_suffix(".raw")
         if raw_path.exists():
-            ltspice = read_ltspice_trace(raw_path, digital["time"], nodes + logit_nodes)
-            ltspice_logits = logits_from_trace(ltspice, model)
-            ltspice_continuous_final = np.abs(ltspice_logits[-1] - continuous_logits[-1])
-            ltspice_final_error = trace_metrics(
-                {"logits": digital_logits[-1]},
-                {"logits": ltspice_logits[-1]},
-                ["logits"],
-            )
-            ltspice_continuous_final_error = trace_metrics(
-                {"logits": continuous_logits[-1]},
-                {"logits": ltspice_logits[-1]},
-                ["logits"],
-            )
-            ltspice_trace_error = trace_metrics(digital, ltspice, nodes)
-            ltspice_continuous_trace_error = trace_metrics(continuous, ltspice, nodes)
-            row.update(
-                {
-                    "ltspice_pred": int(np.argmax(ltspice_logits[-1])),
-                    "ltspice_final_logit_max_abs": float(np.max(np.abs(ltspice_logits[-1] - digital_logits[-1]))),
-                    "ltspice_final_logit_rrmse": ltspice_final_error["rrmse"],
-                    "ltspice_trace_max_abs": ltspice_trace_error["max_abs"],
-                    "ltspice_trace_rrmse": ltspice_trace_error["rrmse"],
-                    "ltspice_vs_continuous_final_logit_max_abs": float(np.max(ltspice_continuous_final)),
-                    "ltspice_vs_continuous_final_logit_rrmse": ltspice_continuous_final_error["rrmse"],
-                    "ltspice_vs_continuous_trace_max_abs": ltspice_continuous_trace_error["max_abs"],
-                    "ltspice_vs_continuous_trace_rrmse": ltspice_continuous_trace_error["rrmse"],
-                    "ltspice_status": "complete",
-                }
-            )
+            try:
+                if not trace_file_ready(raw_path):
+                    raise ValueError(f"{raw_path} is empty.")
+                ltspice = read_ltspice_trace(raw_path, digital["time"], nodes + logit_nodes)
+                ltspice_logits = logits_from_trace(ltspice, model)
+                ltspice_continuous_final = np.abs(ltspice_logits[-1] - continuous_logits[-1])
+                ltspice_final_error = trace_metrics(
+                    {"logits": digital_logits[-1]},
+                    {"logits": ltspice_logits[-1]},
+                    ["logits"],
+                )
+                ltspice_continuous_final_error = trace_metrics(
+                    {"logits": continuous_logits[-1]},
+                    {"logits": ltspice_logits[-1]},
+                    ["logits"],
+                )
+                ltspice_trace_error = trace_metrics(digital, ltspice, nodes)
+                ltspice_continuous_trace_error = trace_metrics(continuous, ltspice, nodes)
+                row.update(
+                    {
+                        "ltspice_pred": int(np.argmax(ltspice_logits[-1])),
+                        "ltspice_final_logit_max_abs": float(np.max(np.abs(ltspice_logits[-1] - digital_logits[-1]))),
+                        "ltspice_final_logit_rrmse": ltspice_final_error["rrmse"],
+                        "ltspice_trace_max_abs": ltspice_trace_error["max_abs"],
+                        "ltspice_trace_rrmse": ltspice_trace_error["rrmse"],
+                        "ltspice_vs_continuous_final_logit_max_abs": float(np.max(ltspice_continuous_final)),
+                        "ltspice_vs_continuous_final_logit_rrmse": ltspice_continuous_final_error["rrmse"],
+                        "ltspice_vs_continuous_trace_max_abs": ltspice_continuous_trace_error["max_abs"],
+                        "ltspice_vs_continuous_trace_rrmse": ltspice_continuous_trace_error["rrmse"],
+                        "ltspice_status": "complete",
+                    }
+                )
+            except Exception as exc:
+                row["ltspice_status"] = f"raw_read_failed:{exc}"
         rows.append(row)
 
     per_sample_path = write_per_sample_csv(out_dir / "per_sample.csv", rows)

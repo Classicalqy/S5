@@ -51,13 +51,19 @@ def _reference_trace(csv_path, nodes):
     return trace
 
 
+def _trace_file_ready(path):
+    path = Path(path)
+    return path.exists() and path.stat().st_size > 0
+
+
 def _maybe_run_ltspice(deck_path, ltspice_bin, run_ltspice_enabled):
     raw_path = Path(deck_path).with_suffix(".raw")
-    if run_ltspice_enabled and not raw_path.exists():
+    if run_ltspice_enabled and not _trace_file_ready(raw_path):
+        raw_path.unlink(missing_ok=True)
         result = run_ltspice(ltspice_bin, deck_path)
         if result.returncode != 0:
             return raw_path, f"ltspice_failed:returncode={result.returncode}"
-    return raw_path, "complete" if raw_path.exists() else "pending"
+    return raw_path, "complete" if _trace_file_ready(raw_path) else "pending"
 
 
 def _layer_nodes(layer_idx, layer_manifest, role):
@@ -186,7 +192,7 @@ def _plot_full_alignment_sample(alignment_dir, model, sample_idx=0):
     sample_dir = Path(alignment_dir) / f"sample_{sample_idx:04d}"
     digital_path = sample_dir / "digital_reference.csv"
     raw_path = sample_dir / f"sample_{sample_idx:04d}.raw"
-    if not digital_path.exists() or not raw_path.exists():
+    if not digital_path.exists() or not _trace_file_ready(raw_path):
         return {}, []
 
     state_nodes = []
@@ -196,8 +202,11 @@ def _plot_full_alignment_sample(alignment_dir, model, sample_idx=0):
         output_nodes.extend(_model_layer_nodes(model, layer_idx, "output"))
     logit_nodes = linear_nodes("LOGIT", model.decoder_bias.shape[0])
     digital = _reference_trace(digital_path, state_nodes + output_nodes + logit_nodes)
-    raw = read_trace_table(raw_path)
-    ltspice = _table_trace(raw, digital["time"], state_nodes + output_nodes + logit_nodes)
+    try:
+        raw = read_trace_table(raw_path)
+        ltspice = _table_trace(raw, digital["time"], state_nodes + output_nodes + logit_nodes)
+    except Exception:
+        return {}, []
 
     logit_plot = sample_dir / "final_logits.png"
     plots = {}

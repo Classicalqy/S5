@@ -105,6 +105,11 @@ def final_logits_from_digital(model, inputs, sample_rate):
     return np.asarray([traces[node][-1] for node in linear_nodes("LOGIT", model.decoder_bias.shape[0])])
 
 
+def trace_file_ready(path):
+    path = Path(path)
+    return path.exists() and path.stat().st_size > 0
+
+
 def final_logits_from_raw(raw_path, logit_nodes, final_time):
     table = read_trace_table(raw_path)
     if "time" not in table:
@@ -337,13 +342,14 @@ def run_accuracy_sample(
     }
     row.update({f"digital_logit{i}": format_spice_value(value) for i, value in enumerate(digital_logits)})
 
-    if run_sim and not raw_path.exists():
+    if run_sim and not trace_file_ready(raw_path):
+        raw_path.unlink(missing_ok=True)
         result = run_ltspice(ltspice_bin, deck_path)
         if result.returncode != 0:
             row.update({"status": "ltspice_failed", "ltspice_pred": "", "error": f"returncode={result.returncode}"})
             return sample_idx, row
 
-    if raw_path.exists():
+    if trace_file_ready(raw_path):
         try:
             final_time = inputs.shape[0] / float(sample_rate)
             ltspice_logits = final_logits_from_raw(raw_path, logit_nodes, final_time)

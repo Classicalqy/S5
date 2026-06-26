@@ -10,6 +10,7 @@ from s5.train import save_params_msgpack
 from s5.ssm_parameterizations import discretize_2x2_blocks, discretize_real_decay, init_RealValuedSSM
 import spice.workflow as spice_workflow
 from spice.compare_transient import compare_traces
+from spice.compare_transient import read_trace_table
 from spice.export_full_model import (
     build_full_netlist,
     emit_linear_stage,
@@ -337,6 +338,14 @@ def test_compare_traces_can_focus_final_sample(tmp_path):
     np.testing.assert_allclose(results["l0_out0"]["max_abs"], 0.01)
 
 
+def test_read_trace_table_rejects_empty_file(tmp_path):
+    empty = tmp_path / "empty.raw"
+    empty.write_text("")
+
+    with pytest.raises(ValueError, match="empty"):
+        read_trace_table(empty)
+
+
 def test_trace_metrics_include_rrmse():
     reference = {"x": np.array([1.0, 2.0, 3.0])}
     candidate = {"x": np.array([1.0, 2.0, 4.0])}
@@ -647,3 +656,28 @@ def test_workflow_attempts_full_alignment_plots_for_each_sample(monkeypatch, tmp
     assert calls == [0, 1]
     assert sorted(summary["full_alignment_plots"]["plots"]) == ["sample_0000", "sample_0001"]
     assert (tmp_path / "workflow_plots" / "full_alignment" / "per_layer_node_rrmse.csv").exists()
+
+
+def test_workflow_treats_empty_raw_as_not_ready(monkeypatch, tmp_path):
+    deck = tmp_path / "sample.cir"
+    raw = tmp_path / "sample.raw"
+    deck.write_text(".end\n")
+    raw.write_text("")
+    calls = []
+
+    def fake_run_ltspice(_ltspice_bin, deck_path):
+        calls.append(deck_path)
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr(spice_workflow, "run_ltspice", fake_run_ltspice)
+
+    raw_path, status = spice_workflow._maybe_run_ltspice(deck, "ltspice", True)
+
+    assert raw_path == raw
+    assert status == "pending"
+    assert calls == [deck]
+    assert not raw.exists()

@@ -64,6 +64,8 @@ def sniff_delimiter(header):
 def read_trace_table(path):
     path = Path(path)
     lines = [line for line in path.read_text().splitlines() if line.strip()]
+    if not lines:
+        raise ValueError(f"{path} is empty or contains no trace rows.")
     if lines and lines[0].startswith("Title:"):
         return read_ltspice_ascii_raw(lines)
     delimiter = sniff_delimiter(lines[0])
