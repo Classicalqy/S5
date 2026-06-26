@@ -61,6 +61,7 @@ def _get_mapping(params, path):
 def _write_layer_params(module, layer, ssm_param, sample_rate):
     delta = np.asarray(layer.delta, dtype=np.float64)
     scale = float(sample_rate) * delta
+    module["C"] = np.asarray(layer.C, dtype=np.asarray(module["C"]).dtype)
     if ssm_param == SSM_PARAM_REAL_DECAY:
         alpha = np.maximum(-layer.A_tr[:, 0, 0] / scale, POSITIVE_EPS)
         module["raw_alpha"] = raw_from_positive(alpha).astype(np.asarray(module["raw_alpha"]).dtype)

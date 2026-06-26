@@ -63,9 +63,7 @@ def choose_capacitance(weights, g_min, g_max, c_min, c_max):
     nonzero = weights[weights > 0.0]
     if nonzero.size == 0:
         return float(c_min)
-    g_mid = np.sqrt(float(g_min) * float(g_max))
-    c_star = g_mid / float(np.median(nonzero))
-    return float(np.clip(c_star, c_min, c_max))
+    return _optimized_capacitance(nonzero, g_min, g_max, c_min, c_max)
 
 
 def quantize_conductance(g, g_min, g_max, bits, mode="linear"):
@@ -131,12 +129,14 @@ def project_layers(layers, config):
     projected_layers = [
         replace(
             layer,
+            C=np.array(layer.C, dtype=np.float64, copy=True),
             A_tr=np.array(layer.A_tr, dtype=np.float64, copy=True),
             B_tr=np.array(layer.B_tr, dtype=np.float64, copy=True),
             capacitances=np.full((layer.n_blocks, layer.state_width), np.nan, dtype=np.float64),
         )
         for layer in layers
     ]
+    rescale_report = _apply_state_rescale(projected_layers, config)
     group_stats = []
 
     for items in _group_items(projected_layers, config.projection_scope):
@@ -165,11 +165,152 @@ def project_layers(layers, config):
     report = {
         "enabled": True,
         "config": config.to_dict(),
+        "state_rescale": rescale_report,
         "aggregate": _aggregate_stats(config, group_stats),
         "layers": _layer_stats(projected_layers, group_stats),
         "groups": group_stats,
     }
     return tuple(projected_layers), report
+
+
+def _optimized_capacitance(weights, g_min, g_max, c_min, c_max):
+    weights = np.abs(np.asarray(weights, dtype=np.float64))
+    weights = weights[weights > 0.0]
+    if weights.size == 0:
+        return float(c_min)
+    c_min = float(c_min)
+    c_max = float(c_max)
+    points = np.concatenate(
+        (
+            np.asarray([c_min, c_max], dtype=np.float64),
+            float(g_min) / weights,
+            float(g_max) / weights,
+        )
+    )
+    points = np.unique(np.clip(points[np.isfinite(points)], c_min, c_max))
+    candidates = [c_min, c_max]
+    candidates.extend(points.tolist())
+    if points.size > 1:
+        candidates.extend(np.sqrt(points[:-1] * points[1:]).tolist())
+    median_c = np.sqrt(float(g_min) * float(g_max)) / float(np.median(weights))
+    median_c = float(np.clip(median_c, c_min, c_max))
+    candidates.append(median_c)
+
+    best_key = None
+    best_c = median_c
+    for c in candidates:
+        c = float(np.clip(c, c_min, c_max))
+        conductance = c * weights
+        clipped = np.clip(conductance, float(g_min), float(g_max))
+        clip_count = int(np.count_nonzero(conductance < float(g_min)) + np.count_nonzero(conductance > float(g_max)))
+        log_error = float(np.mean(np.abs(np.log(clipped / conductance))))
+        key = (clip_count, log_error, abs(np.log(c / median_c)) if median_c > 0.0 else 0.0)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_c = c
+    return float(best_c)
+
+
+def _apply_state_rescale(layers, config):
+    records = []
+    for layer_idx, layer in enumerate(layers):
+        for block_idx in range(layer.n_blocks):
+            block_items = _block_items(layer_idx, layer, block_idx)
+            scale, before, after = _choose_state_scale(layers, block_items, config)
+            if scale != 1.0:
+                layer.B_tr[block_idx] *= scale
+                start = block_idx * layer.state_width
+                end = start + layer.state_width
+                layer.C[:, start:end] /= scale
+            records.append(
+                {
+                    "layer": int(layer_idx),
+                    "block": int(block_idx),
+                    "scale": float(scale),
+                    "clip_fraction_before": float(before["clip_fraction"]),
+                    "clip_fraction_after": float(after["clip_fraction"]),
+                    "num_clipped_before": int(before["num_clipped"]),
+                    "num_clipped_after": int(after["num_clipped"]),
+                    "capacitance_after": float(after["capacitance"]),
+                }
+            )
+    before_total = int(sum(record["num_clipped_before"] for record in records))
+    after_total = int(sum(record["num_clipped_after"] for record in records))
+    conductances = int(sum(_block_nonzero_count(layers[record["layer"]], record["block"]) for record in records))
+    return {
+        "enabled": True,
+        "scope": "block",
+        "num_blocks": int(len(records)),
+        "num_conductances": conductances,
+        "num_clipped_before": before_total,
+        "num_clipped_after": after_total,
+        "clip_fraction_before": float(before_total / conductances) if conductances else 0.0,
+        "clip_fraction_after": float(after_total / conductances) if conductances else 0.0,
+        "scale_min": _finite_summary([record["scale"] for record in records])["min"],
+        "scale_median": _finite_summary([record["scale"] for record in records])["median"],
+        "scale_max": _finite_summary([record["scale"] for record in records])["max"],
+        "blocks": records,
+    }
+
+
+def _choose_state_scale(layers, block_items, config):
+    base_values = _scaled_block_values(layers, block_items, 1.0)
+    before = _clip_summary_for_values(base_values, config)
+    log_grid = np.linspace(-6.0, 6.0, 601)
+    best_scale = 1.0
+    best = before
+    best_key = (
+        before["num_clipped"],
+        before["log_error"],
+        0.0,
+    )
+    for log_scale in log_grid:
+        scale = float(np.exp(log_scale))
+        values = _scaled_block_values(layers, block_items, scale)
+        summary = _clip_summary_for_values(values, config)
+        key = (
+            summary["num_clipped"],
+            summary["log_error"],
+            abs(log_scale),
+        )
+        if key < best_key:
+            best_key = key
+            best_scale = scale
+            best = summary
+    return best_scale, before, best
+
+
+def _scaled_block_values(layers, block_items, scale):
+    values = []
+    for item in block_items:
+        item_values = np.asarray([_read_entry(layers, entry) for entry in item], dtype=np.float64)
+        if item and item[0]["array"] == "B_tr":
+            item_values = item_values * float(scale)
+        values.extend(item_values.tolist())
+    return np.asarray(values, dtype=np.float64)
+
+
+def _clip_summary_for_values(values, config):
+    values = np.abs(np.asarray(values, dtype=np.float64))
+    values = values[values > 0.0]
+    if values.size == 0:
+        return {"num_clipped": 0, "clip_fraction": 0.0, "log_error": 0.0, "capacitance": float(config.c_min)}
+    capacitance = choose_capacitance(values, config.g_min, config.g_max, config.c_min, config.c_max)
+    conductance = float(capacitance) * values
+    clipped = np.clip(conductance, float(config.g_min), float(config.g_max))
+    num_clipped = int(np.count_nonzero(conductance < float(config.g_min)) + np.count_nonzero(conductance > float(config.g_max)))
+    return {
+        "num_clipped": num_clipped,
+        "clip_fraction": float(num_clipped / values.size),
+        "log_error": float(np.mean(np.abs(np.log(clipped / conductance)))),
+        "capacitance": float(capacitance),
+    }
+
+
+def _block_nonzero_count(layer, block_idx):
+    count = int(np.count_nonzero(layer.A_tr[block_idx]))
+    count += int(np.count_nonzero(layer.B_tr[block_idx]))
+    return count
 
 
 def _project_items_to_conductance(layers, items, c, config, rng):

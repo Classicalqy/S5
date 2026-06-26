@@ -302,6 +302,33 @@ def test_hardware_projection_variation_seed_reproducibility():
     assert not np.allclose(same_a[0].A_tr, different[0].A_tr)
 
 
+def test_hardware_projection_state_rescale_updates_output_weights():
+    module = {
+        "B": np.array([[1e-4], [1e-4]], dtype=np.float32),
+        "C": np.array([[2.0, -4.0]], dtype=np.float32),
+        "raw_alpha": np.array([10.0], dtype=np.float32),
+        "omega": np.array([1000.0], dtype=np.float32),
+        "log_step": np.array([[0.0]], dtype=np.float32),
+    }
+    layer = module_to_layer("seq", module, "resonant_2x2", sample_rate=1.0)
+
+    projected, report = project_layers(
+        [layer],
+        HardwareProjectionConfig(
+            hardware_projection="conductance",
+            g_min=1e-6,
+            g_max=1e-4,
+            c_min=1e-12,
+            c_max=1e-6,
+            quant_bits=0,
+        ),
+    )
+
+    scale = report["state_rescale"]["blocks"][0]["scale"]
+    assert scale > 1.0
+    np.testing.assert_allclose(projected[0].C[:, :2], layer.C[:, :2] / scale, rtol=1e-12)
+
+
 def test_projected_manifest_records_stats_and_capacitances():
     params = _nested_params(_single_ssm_params())
 
