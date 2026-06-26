@@ -27,6 +27,7 @@ from spice.export_netlist import (
 from spice.hardware_projection import (
     HardwareProjectionConfig,
     project_layers,
+    project_signed_weights_to_conductance,
     quantize_conductance,
 )
 from spice.metrics import trace_metrics
@@ -327,6 +328,35 @@ def test_hardware_projection_state_rescale_updates_output_weights():
     scale = report["state_rescale"]["blocks"][0]["scale"]
     assert scale > 1.0
     np.testing.assert_allclose(projected[0].C[:, :2], layer.C[:, :2] / scale, rtol=1e-12)
+
+
+def test_hardware_projection_low_clip_maps_to_zero():
+    weights = np.array([1e-3, 2.0], dtype=np.float64)
+
+    projected, stats = project_signed_weights_to_conductance(
+        weights,
+        c=1e-6,
+        g_min=1e-6,
+        g_max=1e-4,
+        quant_bits=0,
+    )
+
+    assert projected[0] == 0.0
+    assert projected[1] == weights[1]
+    assert stats["num_clipped_low"] == 1
+
+
+def test_full_alignment_state_trace_rescale_uses_projection_report():
+    trace = {
+        "time": np.array([0.0, 1.0]),
+        "L0_B0_x0": np.array([2.0, 4.0]),
+        "LOGIT0": np.array([3.0, 5.0]),
+    }
+
+    rescaled = spice_workflow._rescale_state_trace(trace, {"L0_B0_x0": 2.0})
+
+    np.testing.assert_allclose(rescaled["L0_B0_x0"], np.array([1.0, 2.0]))
+    np.testing.assert_allclose(rescaled["LOGIT0"], trace["LOGIT0"])
 
 
 def test_projected_manifest_records_stats_and_capacitances():

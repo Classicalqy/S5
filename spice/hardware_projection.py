@@ -102,11 +102,18 @@ def project_signed_weights_to_conductance(weights, c, g_min, g_max, quant_bits=0
     g_before = float(c) * np.abs(weights[mask])
     if g_before.size == 0:
         return projected, _group_stats(c, g_before, g_before, g_before, g_before, 0, 0)
-    g_clipped = np.clip(g_before, float(g_min), float(g_max))
-    g_quantized = quantize_conductance(g_clipped, g_min, g_max, quant_bits, quant_mode)
+    low = g_before < float(g_min)
+    high = g_before > float(g_max)
+    in_range = ~(low | high)
+    g_clipped = np.where(low, 0.0, np.minimum(g_before, float(g_max)))
+    g_quantized = g_clipped.copy()
+    g_quantized[in_range] = quantize_conductance(g_clipped[in_range], g_min, g_max, quant_bits, quant_mode)
+    g_quantized[high] = quantize_conductance(np.asarray([float(g_max)]), g_min, g_max, quant_bits, quant_mode)[0]
     if rng is None:
         rng = np.random.default_rng(0)
-    g_after = add_conductance_variation(g_quantized, variation_sigma, rng)
+    g_after = g_quantized.copy()
+    nonzero_g = g_after > 0.0
+    g_after[nonzero_g] = add_conductance_variation(g_after[nonzero_g], variation_sigma, rng)
     projected[mask] = np.sign(weights[mask]) * g_after / float(c)
     stats = _group_stats(
         c,
@@ -330,9 +337,14 @@ def _project_items_to_conductance(layers, items, c, config, rng):
             continue
         representative_abs = float(np.median(np.abs(values[mask])))
         g_before = float(c) * representative_abs
-        g_clipped = float(np.clip(g_before, config.g_min, config.g_max))
-        g_quantized = float(quantize_conductance(np.asarray([g_clipped]), config.g_min, config.g_max, config.quant_bits, config.quant_mode)[0])
-        g_after = float(add_conductance_variation(np.asarray([g_quantized]), config.variation_sigma, rng)[0])
+        if g_before < config.g_min:
+            g_clipped = 0.0
+            g_quantized = 0.0
+            g_after = 0.0
+        else:
+            g_clipped = float(min(g_before, config.g_max))
+            g_quantized = float(quantize_conductance(np.asarray([g_clipped]), config.g_min, config.g_max, config.quant_bits, config.quant_mode)[0])
+            g_after = float(add_conductance_variation(np.asarray([g_quantized]), config.variation_sigma, rng)[0])
         for entry, value in zip(item, values):
             if value == 0.0:
                 projected_items.append((entry, 0.0))

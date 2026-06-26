@@ -472,6 +472,7 @@ def run_full_alignment_pair(
     exact_cir,
     projected_params,
     projected_cir,
+    projection_report,
     ssm_param,
     sample_rate,
     out_dir,
@@ -552,6 +553,7 @@ def run_full_alignment_pair(
     for layer_idx, layer in enumerate(exact_model.ssm_layers):
         state_nodes.extend(layer.state_nodes(layer_idx))
     logit_nodes = linear_nodes("LOGIT", exact_model.decoder_bias.shape[0])
+    state_scale_map = _state_scale_map(projection_report, exact_model)
     for sample_idx in range(int(num_samples)):
         sample_key = f"sample_{sample_idx:04d}"
         sample_dir = out_dir / sample_key
@@ -559,18 +561,20 @@ def run_full_alignment_pair(
         projected_sample = projected_dir / sample_key
         exact_digital = _reference_trace(exact_sample / "digital_reference.csv", state_nodes + logit_nodes)
         projected_digital = _reference_trace(projected_sample / "digital_reference.csv", state_nodes + logit_nodes)
+        projected_digital_for_states = _rescale_state_trace(projected_digital, state_scale_map)
         trace_map = {
             "exact_digital": exact_digital,
-            "projected_digital": projected_digital,
+            "projected_digital": projected_digital_for_states,
         }
         exact_raw = exact_sample / f"{sample_key}.raw"
         projected_raw = projected_sample / f"{sample_key}.raw"
         if _trace_file_ready(exact_raw):
             trace_map["exact_ltspice"] = read_ltspice_trace(exact_raw, exact_digital["time"], state_nodes + logit_nodes)
         if _trace_file_ready(projected_raw):
-            trace_map["projected_ltspice"] = read_ltspice_trace(projected_raw, projected_digital["time"], state_nodes + logit_nodes)
+            projected_ltspice = read_ltspice_trace(projected_raw, projected_digital["time"], state_nodes + logit_nodes)
+            trace_map["projected_ltspice"] = _rescale_state_trace(projected_ltspice, state_scale_map)
         state_error = [
-            (node, rrmse(exact_digital[node], projected_digital[node]))
+            (node, rrmse(exact_digital[node], projected_digital_for_states[node]))
             for node in state_nodes
         ]
         chosen_nodes = state_nodes[:2] + [node for node, _ in sorted(state_error, key=lambda item: item[1], reverse=True)[:2]]
@@ -607,6 +611,32 @@ def run_full_alignment_pair(
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "summary.json").write_text(json.dumps(combined, indent=2, sort_keys=True))
     return combined
+
+
+def _state_scale_map(projection_report, model):
+    scales = {}
+    if not projection_report:
+        return scales
+    for record in projection_report.get("state_rescale", {}).get("blocks", []):
+        layer_idx = int(record["layer"])
+        block_idx = int(record["block"])
+        scale = float(record.get("scale", 1.0))
+        if scale == 0.0:
+            continue
+        layer = model.ssm_layers[layer_idx]
+        for state_idx in range(layer.state_width):
+            scales[_state_node(layer_idx, block_idx, state_idx)] = scale
+    return scales
+
+
+def _rescale_state_trace(trace, state_scale_map):
+    if not state_scale_map:
+        return trace
+    rescaled = dict(trace)
+    for node, scale in state_scale_map.items():
+        if node in rescaled and scale != 1.0:
+            rescaled[node] = np.asarray(rescaled[node], dtype=np.float64) / float(scale)
+    return rescaled
 
 
 def run_accuracy_pair(
@@ -844,6 +874,7 @@ def run_workflow(
                 exact_cir=original_netlists["full_model_cir"],
                 projected_params=projected_params,
                 projected_cir=projected_netlists["full_model_cir"],
+                projection_report=projection_report,
                 ssm_param=ssm_param,
                 sample_rate=sample_rate,
                 out_dir=out_dir / "full_alignment" / case,
