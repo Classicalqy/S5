@@ -10,6 +10,8 @@ from pathlib import Path
 import numpy as np
 from flax.serialization import msgpack_restore
 
+from .hardware_projection import HardwareProjectionConfig, PROJECTION_NONE, project_layers
+
 
 POSITIVE_EPS = 1e-4
 SSM_PARAM_REAL_DECAY = "real_decay"
@@ -88,6 +90,7 @@ class SsmLayer:
     delta: np.ndarray
     A_tr: np.ndarray
     B_tr: np.ndarray
+    capacitances: np.ndarray | None = None
 
     @property
     def n_blocks(self):
@@ -257,7 +260,7 @@ def _component_record(name, kind, nodes, value=None, role=None, **extra):
     return record
 
 
-def add_model_header(builder, state_capacitance, dense_included=False):
+def add_model_header(builder, state_capacitance, dense_included=False, use_global_state_capacitance=True):
     builder.line("* LTSpice netlist generated from hardware-friendly S5 SSM layers")
     if dense_included:
         builder.line("* Dense encoder/decoder are included; normalization, residual, and non-ReLU activations are not included.")
@@ -273,8 +276,9 @@ def add_model_header(builder, state_capacitance, dense_included=False):
     builder.line("Xop 0 n_inv out ideal_opamp")
     builder.line(".ends unity_inverter")
     builder.line()
-    builder.line(f".param CSTATE={format_spice_value(state_capacitance)}")
-    builder.line()
+    if use_global_state_capacitance:
+        builder.line(f".param CSTATE={format_spice_value(state_capacitance)}")
+        builder.line()
 
 
 def add_unity_inverter(builder, components, name, source_node, output_node):
@@ -282,11 +286,22 @@ def add_unity_inverter(builder, components, name, source_node, output_node):
     components.append(_component_record(name, "subckt", [source_node, output_node], role="unity_inverter"))
 
 
-def add_integrator_state(builder, components, layer_idx, block_idx, state_idx, state_node, sum_node, state_capacitance):
+def add_integrator_state(
+    builder,
+    components,
+    layer_idx,
+    block_idx,
+    state_idx,
+    state_node,
+    sum_node,
+    state_capacitance,
+    use_global_state_capacitance=True,
+):
     op_name = f"XOP_L{layer_idx}_B{block_idx}_S{state_idx}"
     cap_name = f"C_L{layer_idx}_B{block_idx}_S{state_idx}"
+    cap_value = "{CSTATE}" if use_global_state_capacitance else format_spice_value(state_capacitance)
     builder.component(op_name, f"{op_name} 0 {sum_node} {state_node} ideal_opamp")
-    builder.component(cap_name, f"{cap_name} {state_node} {sum_node} {{CSTATE}}")
+    builder.component(cap_name, f"{cap_name} {state_node} {sum_node} {cap_value}")
     components.extend(
         [
             _component_record(op_name, "opamp", ["0", sum_node, state_node], role="state_integrator"),
@@ -314,7 +329,13 @@ def add_gain_resistor(builder, components, name, source_node, sum_node, gain, st
     return True
 
 
-def emit_block_subckt(builder, layer, layer_idx, block_idx, state_capacitance):
+def _state_capacitance(layer, block_idx, state_idx, state_capacitance):
+    if layer.capacitances is None:
+        return float(state_capacitance)
+    return float(layer.capacitances[block_idx, state_idx])
+
+
+def emit_block_subckt(builder, layer, layer_idx, block_idx, state_capacitance, use_global_state_capacitance=True):
     block = _layer_block_name(layer, layer_idx, block_idx)
     pins = _subckt_pin_list(layer, layer_idx, block_idx)
     input_pins = pins[: layer.input_dim]
@@ -324,6 +345,7 @@ def emit_block_subckt(builder, layer, layer_idx, block_idx, state_capacitance):
 
     builder.line(f".subckt {block} {' '.join(pins)}")
     for state_idx, (state_node, sum_node) in enumerate(zip(state_pins, sum_nodes)):
+        cap = _state_capacitance(layer, block_idx, state_idx, state_capacitance)
         add_integrator_state(
             builder,
             components,
@@ -332,11 +354,13 @@ def emit_block_subckt(builder, layer, layer_idx, block_idx, state_capacitance):
             state_idx,
             state_node,
             sum_node,
-            state_capacitance,
+            cap,
+            use_global_state_capacitance,
         )
 
     for state_idx, (state_node, sum_node) in enumerate(zip(state_pins, sum_nodes)):
         gain = layer.A_tr[block_idx, state_idx, state_idx]
+        cap = _state_capacitance(layer, block_idx, state_idx, state_capacitance)
         add_gain_resistor(
             builder,
             components,
@@ -344,7 +368,7 @@ def emit_block_subckt(builder, layer, layer_idx, block_idx, state_capacitance):
             state_node,
             sum_node,
             gain,
-            state_capacitance,
+            cap,
             "state_decay",
         )
 
@@ -356,7 +380,8 @@ def emit_block_subckt(builder, layer, layer_idx, block_idx, state_capacitance):
         ]
         inverted_sources = {}
         for target_state, source_state, gain, source_node, sum_node in cross_specs:
-            if resistance_for_gain(gain, state_capacitance) is None:
+            cap = _state_capacitance(layer, block_idx, target_state, state_capacitance)
+            if resistance_for_gain(gain, cap) is None:
                 continue
             actual_source = source_node
             polarity = "direct"
@@ -376,7 +401,7 @@ def emit_block_subckt(builder, layer, layer_idx, block_idx, state_capacitance):
                 actual_source,
                 sum_node,
                 gain,
-                state_capacitance,
+                cap,
                 "cross_coupling",
                 source_state=source_state,
                 target_state=target_state,
@@ -384,9 +409,10 @@ def emit_block_subckt(builder, layer, layer_idx, block_idx, state_capacitance):
             )
 
     for state_idx, sum_node in enumerate(sum_nodes):
+        cap = _state_capacitance(layer, block_idx, state_idx, state_capacitance)
         for input_idx, input_node in enumerate(input_pins):
             gain = layer.B_tr[block_idx, state_idx, input_idx]
-            if resistance_for_gain(gain, state_capacitance) is None:
+            if resistance_for_gain(gain, cap) is None:
                 continue
             actual_source = input_node
             polarity = "direct"
@@ -403,7 +429,7 @@ def emit_block_subckt(builder, layer, layer_idx, block_idx, state_capacitance):
                 actual_source,
                 sum_node,
                 gain,
-                state_capacitance,
+                cap,
                 "input_weight",
                 input_index=input_idx,
                 state_index=state_idx,
@@ -509,14 +535,36 @@ def emit_top_level_instances(builder, layers):
     builder.line(".end")
 
 
-def build_netlist(params, ssm_param, sample_rate, state_capacitance=1e-6):
+def _normalize_projection_config(projection_config=None, **kwargs):
+    if projection_config is None:
+        values = {key: value for key, value in kwargs.items() if value is not None}
+        return HardwareProjectionConfig(**values)
+    if isinstance(projection_config, HardwareProjectionConfig):
+        return projection_config
+    if hasattr(projection_config, "items"):
+        values = dict(projection_config)
+        values.update({key: value for key, value in kwargs.items() if value is not None})
+        return HardwareProjectionConfig(**values)
+    raise TypeError("projection_config must be None, a dict, or HardwareProjectionConfig.")
+
+
+def _projection_enabled(projection_config):
+    return projection_config.hardware_projection != PROJECTION_NONE
+
+
+def build_netlist(params, ssm_param, sample_rate, state_capacitance=1e-6, projection_config=None):
     modules = find_ssm_modules(params)
     if not modules:
         raise ValueError("No hardware-friendly SSM modules found in parameter tree.")
 
     layers = [module_to_layer(path, module, ssm_param, sample_rate) for path, module in modules]
+    projection_config = _normalize_projection_config(projection_config)
+    projection_report = None
+    if _projection_enabled(projection_config):
+        layers, projection_report = project_layers(layers, projection_config)
     builder = NetlistBuilder()
-    add_model_header(builder, state_capacitance)
+    use_global_state_capacitance = not _projection_enabled(projection_config)
+    add_model_header(builder, state_capacitance, use_global_state_capacitance=use_global_state_capacitance)
 
     manifest = {
         "ssm_param": ssm_param,
@@ -524,6 +572,8 @@ def build_netlist(params, ssm_param, sample_rate, state_capacitance=1e-6):
         "state_capacitance": float(state_capacitance),
         "layers": [],
     }
+    if projection_report is not None:
+        manifest["projection"] = projection_report
 
     for layer_idx, layer in enumerate(layers):
         layer_record = {
@@ -544,9 +594,18 @@ def build_netlist(params, ssm_param, sample_rate, state_capacitance=1e-6):
             "outputs": [],
             "components": [],
         }
+        if layer.capacitances is not None:
+            layer_record["state_capacitances"] = np.asarray(layer.capacitances, dtype=np.float64).tolist()
         builder.line(f"* Layer {layer_idx}: {layer.path}")
         for block_idx in range(layer.n_blocks):
-            components = emit_block_subckt(builder, layer, layer_idx, block_idx, state_capacitance)
+            components = emit_block_subckt(
+                builder,
+                layer,
+                layer_idx,
+                block_idx,
+                state_capacitance,
+                use_global_state_capacitance=use_global_state_capacitance,
+            )
             layer_record["blocks"].append(
                 {
                     "index": block_idx,
@@ -558,6 +617,11 @@ def build_netlist(params, ssm_param, sample_rate, state_capacitance=1e-6):
                     "components": components,
                 }
             )
+            if layer.capacitances is not None:
+                layer_record["blocks"][-1]["state_capacitances"] = [
+                    float(layer.capacitances[block_idx, state_idx])
+                    for state_idx in range(layer.state_width)
+                ]
             layer_record["components"].extend(components)
         output_components, output_records = emit_output_stage(builder, layer, layer_idx)
         layer_record["components"].extend(output_components)
@@ -568,9 +632,18 @@ def build_netlist(params, ssm_param, sample_rate, state_capacitance=1e-6):
     return builder.render(), manifest
 
 
-def export_netlist(params_path, ssm_param, sample_rate, out_path, json_out=None, state_capacitance=1e-6):
+def export_netlist(
+    params_path,
+    ssm_param,
+    sample_rate,
+    out_path,
+    json_out=None,
+    state_capacitance=1e-6,
+    projection_config=None,
+    projection_report=None,
+):
     params = load_flax_params(params_path)
-    netlist, manifest = build_netlist(params, ssm_param, sample_rate, state_capacitance)
+    netlist, manifest = build_netlist(params, ssm_param, sample_rate, state_capacitance, projection_config=projection_config)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(netlist)
@@ -578,7 +651,41 @@ def export_netlist(params_path, ssm_param, sample_rate, out_path, json_out=None,
     json_path = Path(json_out) if json_out else out_path.with_name(f"{out_path.stem}_components.json")
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    if projection_report is not None and "projection" in manifest:
+        report_path = Path(projection_report)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(manifest["projection"], indent=2, sort_keys=True))
     return out_path, json_path
+
+
+def add_projection_args(parser):
+    parser.add_argument("--hardware-projection", "--hardware_projection", default=PROJECTION_NONE, choices=["none", "conductance"])
+    parser.add_argument("--projection-scope", "--projection_scope", default="block", choices=sorted({"global", "layer", "block", "row"}))
+    parser.add_argument("--g-min", "--g_min", type=float, default=1e-6)
+    parser.add_argument("--g-max", "--g_max", type=float, default=150e-6)
+    parser.add_argument("--c-min", "--c_min", type=float, default=1e-12)
+    parser.add_argument("--c-max", "--c_max", type=float, default=1e-6)
+    parser.add_argument("--quant-bits", "--quant_bits", type=int, default=0)
+    parser.add_argument("--quant-mode", "--quant_mode", default="none", choices=sorted({"none", "linear", "log"}))
+    parser.add_argument("--variation-sigma", "--variation_sigma", type=float, default=0.0)
+    parser.add_argument("--variation-seed", "--variation_seed", type=int, default=0)
+    parser.add_argument("--projection-report", "--projection_report", default=None)
+    return parser
+
+
+def projection_config_from_args(args):
+    return HardwareProjectionConfig(
+        hardware_projection=args.hardware_projection,
+        projection_scope=args.projection_scope,
+        g_min=args.g_min,
+        g_max=args.g_max,
+        c_min=args.c_min,
+        c_max=args.c_max,
+        quant_bits=args.quant_bits,
+        quant_mode=args.quant_mode,
+        variation_sigma=args.variation_sigma,
+        variation_seed=args.variation_seed,
+    )
 
 
 def parse_args(argv=None):
@@ -589,6 +696,7 @@ def parse_args(argv=None):
     parser.add_argument("--state-capacitance", type=float, default=1e-6)
     parser.add_argument("--out", required=True, help="Output LTSpice .cir file.")
     parser.add_argument("--json-out", default=None, help="Optional component manifest path.")
+    add_projection_args(parser)
     return parser.parse_args(argv)
 
 
@@ -601,6 +709,8 @@ def main(argv=None):
         out_path=args.out,
         json_out=args.json_out,
         state_capacitance=args.state_capacitance,
+        projection_config=projection_config_from_args(args),
+        projection_report=args.projection_report,
     )
     print(f"Wrote LTSpice netlist: {cir_path}")
     print(f"Wrote component manifest: {json_path}")

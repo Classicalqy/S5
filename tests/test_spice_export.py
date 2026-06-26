@@ -24,7 +24,13 @@ from spice.export_netlist import (
     module_to_layer,
     positive,
 )
+from spice.hardware_projection import (
+    HardwareProjectionConfig,
+    project_layers,
+    quantize_conductance,
+)
 from spice.metrics import trace_metrics
+from spice.plots import trace_line_style
 from spice.trace_utils import zoh_pwl_source_line
 from spice.validate_digital_alignment import (
     generate_digital_alignment_artifacts,
@@ -222,6 +228,104 @@ def test_netlist_smoke_contains_expected_block_parts_and_unique_ids():
             continue
         component_ids.append(line.split()[0])
     assert len(component_ids) == len(set(component_ids))
+
+
+def test_state_compare_styles_digital_dashed_and_ltspice_solid():
+    assert trace_line_style("exact_digital") == "--"
+    assert trace_line_style("projected_digital") == "--"
+    assert trace_line_style("exact_ltspice") == "-"
+    assert trace_line_style("projected_ltspice") == "-"
+
+
+def test_hardware_projection_none_preserves_netlist():
+    params = _nested_params(_single_ssm_params())
+
+    baseline, _ = build_netlist(params, "resonant_2x2", sample_rate=16000.0)
+    projected, _ = build_netlist(
+        params,
+        "resonant_2x2",
+        sample_rate=16000.0,
+        projection_config=HardwareProjectionConfig(),
+    )
+
+    assert projected == baseline
+
+
+def test_hardware_projection_wide_ranges_preserve_coefficients():
+    params = _nested_params(_single_ssm_params())
+    layer = module_to_layer("seq", find_ssm_modules(params)[0][1], "resonant_2x2", sample_rate=10.0)
+
+    projected_layers, report = project_layers(
+        [layer],
+        HardwareProjectionConfig(
+            hardware_projection="conductance",
+            g_min=1e-12,
+            g_max=1e12,
+            c_min=1e-12,
+            c_max=1e12,
+            quant_bits=0,
+        ),
+    )
+
+    np.testing.assert_allclose(projected_layers[0].A_tr, layer.A_tr, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(projected_layers[0].B_tr, layer.B_tr, rtol=1e-12, atol=1e-12)
+    assert report["aggregate"]["clip_fraction"] == 0.0
+
+
+def test_quant_bits_reduce_distinct_conductance_levels():
+    conductances = np.linspace(1e-6, 1e-4, 64)
+
+    high = quantize_conductance(conductances, 1e-6, 1e-4, bits=6, mode="linear")
+    low = quantize_conductance(conductances, 1e-6, 1e-4, bits=2, mode="linear")
+
+    assert np.unique(low).size < np.unique(high).size
+
+
+def test_hardware_projection_variation_seed_reproducibility():
+    params = _nested_params(_single_ssm_params())
+    layer = module_to_layer("seq", find_ssm_modules(params)[0][1], "resonant_2x2", sample_rate=10.0)
+    cfg = HardwareProjectionConfig(
+        hardware_projection="conductance",
+        g_min=1e-12,
+        g_max=1e12,
+        c_min=1e-12,
+        c_max=1e12,
+        variation_sigma=0.05,
+        variation_seed=7,
+    )
+
+    same_a, _ = project_layers([layer], cfg)
+    same_b, _ = project_layers([layer], cfg)
+    different, _ = project_layers([layer], HardwareProjectionConfig(**{**cfg.to_dict(), "variation_seed": 8}))
+
+    np.testing.assert_allclose(same_a[0].A_tr, same_b[0].A_tr)
+    assert not np.allclose(same_a[0].A_tr, different[0].A_tr)
+
+
+def test_projected_manifest_records_stats_and_capacitances():
+    params = _nested_params(_single_ssm_params())
+
+    netlist, manifest = build_netlist(
+        params,
+        "resonant_2x2",
+        sample_rate=10.0,
+        projection_config=HardwareProjectionConfig(
+            hardware_projection="conductance",
+            g_min=1e-6,
+            g_max=1e-4,
+            c_min=1e-9,
+            c_max=1e-6,
+            quant_bits=2,
+            quant_mode="linear",
+        ),
+    )
+
+    assert "projection" in manifest
+    assert manifest["projection"]["aggregate"]["num_conductances"] > 0
+    assert "state_capacitances" in manifest["layers"][0]
+    assert "{CSTATE}" not in netlist
+    assert "e-09" in netlist or "e-06" in netlist
+    assert all(c["value"] > 0 for c in manifest["layers"][0]["components"] if c["kind"] in {"resistor", "capacitor"})
 
 
 def test_load_flax_params_msgpack_file(tmp_path):
@@ -622,11 +726,12 @@ def test_unified_workflow_no_run_generates_artifacts(tmp_path):
         labels=np.array([0, 1]),
     )
 
-    assert (tmp_path / "workflow" / "netlists" / "ssm_layers.cir").exists()
-    assert (tmp_path / "workflow" / "netlists" / "full_model.cir").exists()
-    assert (tmp_path / "workflow" / "layer_sanity" / "summary.json").exists()
-    assert (tmp_path / "workflow" / "full_alignment" / "summary.json").exists()
-    assert (tmp_path / "workflow" / "accuracy" / "summary.json").exists()
+    assert (tmp_path / "workflow" / "netlist" / "original" / "ssm_layers.cir").exists()
+    assert (tmp_path / "workflow" / "netlist" / "original" / "full_model.cir").exists()
+    assert (tmp_path / "workflow" / "netlist" / "original" / "params.msgpack").exists()
+    assert (tmp_path / "workflow" / "layer_sanity" / "original" / "summary.json").exists()
+    assert (tmp_path / "workflow" / "full_alignment" / "original" / "summary.json").exists()
+    assert (tmp_path / "workflow" / "accuracy" / "original" / "summary.json").exists()
     assert summary["accuracy"]["status"] == "pending"
 
 
@@ -655,7 +760,7 @@ def test_workflow_attempts_full_alignment_plots_for_each_sample(monkeypatch, tmp
 
     assert calls == [0, 1]
     assert sorted(summary["full_alignment_plots"]["plots"]) == ["sample_0000", "sample_0001"]
-    assert (tmp_path / "workflow_plots" / "full_alignment" / "per_layer_node_rrmse.csv").exists()
+    assert (tmp_path / "workflow_plots" / "full_alignment" / "original" / "per_layer_node_rrmse.csv").exists()
 
 
 def test_workflow_treats_empty_raw_as_not_ready(monkeypatch, tmp_path):
@@ -681,3 +786,47 @@ def test_workflow_treats_empty_raw_as_not_ready(monkeypatch, tmp_path):
     assert status == "pending"
     assert calls == [deck]
     assert not raw.exists()
+
+
+def test_workflow_hardware_projection_sweep_writes_outputs(tmp_path):
+    params = _full_model_params()
+    params_path = save_params_msgpack(params, tmp_path / "params.msgpack")
+
+    summary = run_workflow(
+        params_path=params_path,
+        ssm_param="resonant_2x2",
+        sample_rate=10.0,
+        out_dir=tmp_path / "hardware",
+        hardware_projection=True,
+        quant_bits=[2],
+        variation_sigma=[0.0],
+        g_min=1e-6,
+        g_max=1e-4,
+        c_min=1e-9,
+        c_max=1e-6,
+        run_ltspice_enabled=False,
+        samples=np.zeros((2, 4, 1), dtype=np.float64),
+        labels=np.array([0, 1]),
+        full_samples=2,
+        accuracy_samples=2,
+    )
+
+    case_dir = tmp_path / "hardware" / "netlist" / "q2_v0"
+    assert (case_dir / "params.msgpack").exists()
+    assert (case_dir / "ssm_layers.cir").exists()
+    assert (case_dir / "full_model.cir").exists()
+    assert (case_dir / "projection_report.json").exists()
+    projected = load_flax_params(case_dir / "params.msgpack")
+    original_modules = find_ssm_modules(params)
+    projected_modules = find_ssm_modules(projected)
+    assert [path for path, _ in projected_modules] == [path for path, _ in original_modules]
+    for (_path, original), (_projected_path, mapped) in zip(original_modules, projected_modules):
+        assert set(mapped) == set(original)
+        for key in ("B", "C", "raw_alpha", "log_step", "omega"):
+            if key in original:
+                assert np.asarray(mapped[key]).shape == np.asarray(original[key]).shape
+    assert (tmp_path / "hardware" / "layer_sanity" / "q2_v0" / "summary.json").exists()
+    assert (tmp_path / "hardware" / "full_alignment" / "q2_v0" / "summary.json").exists()
+    assert (tmp_path / "hardware" / "accuracy" / "q2_v0" / "summary.json").exists()
+    assert summary["projection_runs"][0]["case"] == "q2_v0"
+    assert summary["projection_runs"][0]["accuracy"]["source"] == "full_alignment"

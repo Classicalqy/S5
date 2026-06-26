@@ -136,7 +136,8 @@ python -m spice.workflow \
 
 The workflow writes:
 
-- `netlists/ssm_layers.cir` and `netlists/full_model.cir`,
+- `netlist/original/ssm_layers.cir`, `netlist/original/full_model.cir`, and
+  `netlist/original/params.msgpack`,
 - `layer_sanity/summary.json` plus per-layer Python reference CSV, LTSpice
   deck, rRMSE metrics, and state overlay PNGs,
 - `full_alignment/summary.json`, per-sample digital/continuous references,
@@ -169,3 +170,27 @@ Its logit-difference fields are named `ltspice_vs_digital_*` intentionally:
 they compare the LTSpice continuous cascade final logits against the digital
 stacked recurrence final logits. Those differences therefore include both
 analog transient error and the expected model-semantics difference.
+
+## Hardware Projection Workflow
+
+Use `spice.workflow` with `--hardware-projection True` to sweep conductance
+projection, quantization, and variation:
+
+```bash
+python -m spice.workflow \
+  --params checkpoints/mnist_energy_shaped_2x2_seed0_params.msgpack \
+  --ssm-param energy_shaped_2x2 \
+  --sample-rate 16000 \
+  --out-dir out/spice_energy_shaped_5 \
+  --hardware-projection True \
+  --quant-bits 2 4 8 \
+  --variation-sigma 0.01 0.05 \
+  --full-samples 5 \
+  --accuracy-samples 5
+```
+
+For each sweep case, the workflow writes projected layer/full-model netlists,
+`projection_report.json`, and a projected `params.msgpack` under
+`netlist/q*_v*/`. The projected params keep the original model tree shape and
+replace only the hardware-friendly SSM parameters corresponding to projected
+continuous-time `A_tr` and `B_tr`.

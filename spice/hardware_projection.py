@@ -1,0 +1,439 @@
+"""Hardware-aware projection for continuous-time SSM coefficients."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+
+import numpy as np
+
+
+PROJECTION_NONE = "none"
+PROJECTION_CONDUCTANCE = "conductance"
+PROJECTION_SCOPES = {"global", "layer", "block", "row"}
+QUANT_MODES = {"none", "linear", "log"}
+
+
+@dataclass(frozen=True)
+class HardwareProjectionConfig:
+    hardware_projection: str = PROJECTION_NONE
+    projection_scope: str = "block"
+    g_min: float = 1e-6
+    g_max: float = 150e-6
+    c_min: float = 1e-12
+    c_max: float = 1e-6
+    quant_bits: int = 0
+    quant_mode: str = "none"
+    variation_sigma: float = 0.0
+    variation_seed: int = 0
+
+    def validate(self):
+        if self.hardware_projection not in {PROJECTION_NONE, PROJECTION_CONDUCTANCE}:
+            raise ValueError("hardware_projection must be 'none' or 'conductance'.")
+        if self.projection_scope not in PROJECTION_SCOPES:
+            raise ValueError("projection_scope must be one of global, layer, block, row.")
+        if self.quant_mode not in QUANT_MODES:
+            raise ValueError("quant_mode must be one of none, linear, log.")
+        if self.g_min <= 0 or self.g_max <= 0 or self.g_min >= self.g_max:
+            raise ValueError("Expected 0 < g_min < g_max.")
+        if self.c_min <= 0 or self.c_max <= 0 or self.c_min > self.c_max:
+            raise ValueError("Expected 0 < c_min <= c_max.")
+        if self.quant_bits < 0:
+            raise ValueError("quant_bits must be non-negative.")
+        if self.variation_sigma < 0:
+            raise ValueError("variation_sigma must be non-negative.")
+        return self
+
+    def to_dict(self):
+        return {
+            "hardware_projection": self.hardware_projection,
+            "projection_scope": self.projection_scope,
+            "g_min": float(self.g_min),
+            "g_max": float(self.g_max),
+            "c_min": float(self.c_min),
+            "c_max": float(self.c_max),
+            "quant_bits": int(self.quant_bits),
+            "quant_mode": self.quant_mode,
+            "variation_sigma": float(self.variation_sigma),
+            "variation_seed": int(self.variation_seed),
+        }
+
+
+def choose_capacitance(weights, g_min, g_max, c_min, c_max):
+    weights = np.abs(np.asarray(weights, dtype=np.float64))
+    nonzero = weights[weights > 0.0]
+    if nonzero.size == 0:
+        return float(c_min)
+    g_mid = np.sqrt(float(g_min) * float(g_max))
+    c_star = g_mid / float(np.median(nonzero))
+    return float(np.clip(c_star, c_min, c_max))
+
+
+def quantize_conductance(g, g_min, g_max, bits, mode="linear"):
+    g = np.asarray(g, dtype=np.float64)
+    if int(bits) <= 0 or mode == "none" or g.size == 0:
+        return g.copy()
+    levels = 2 ** int(bits)
+    if levels <= 1:
+        return np.full_like(g, float(g_min))
+    if mode == "linear":
+        grid = np.linspace(float(g_min), float(g_max), levels)
+        idx = np.rint((g - float(g_min)) / (float(g_max) - float(g_min)) * (levels - 1)).astype(int)
+        return grid[np.clip(idx, 0, levels - 1)]
+    if mode == "log":
+        log_min = np.log(float(g_min))
+        log_max = np.log(float(g_max))
+        grid = np.exp(np.linspace(log_min, log_max, levels))
+        idx = np.rint((np.log(g) - log_min) / (log_max - log_min) * (levels - 1)).astype(int)
+        return grid[np.clip(idx, 0, levels - 1)]
+    raise ValueError("quantize_conductance mode must be one of none, linear, log.")
+
+
+def add_conductance_variation(g, sigma, rng):
+    g = np.asarray(g, dtype=np.float64)
+    if float(sigma) <= 0.0 or g.size == 0:
+        return g.copy()
+    varied = g * (1.0 + rng.normal(0.0, float(sigma), size=g.shape))
+    return np.maximum(varied, np.finfo(np.float64).tiny)
+
+
+def project_signed_weights_to_conductance(weights, c, g_min, g_max, quant_bits=0, quant_mode="none", variation_sigma=0.0, rng=None):
+    """Project signed coefficients through G = C*|w| and w = sign(w)*G/C."""
+    weights = np.asarray(weights, dtype=np.float64)
+    projected = weights.copy()
+    mask = weights != 0.0
+    g_before = float(c) * np.abs(weights[mask])
+    if g_before.size == 0:
+        return projected, _group_stats(c, g_before, g_before, g_before, g_before, 0, 0)
+    g_clipped = np.clip(g_before, float(g_min), float(g_max))
+    g_quantized = quantize_conductance(g_clipped, g_min, g_max, quant_bits, quant_mode)
+    if rng is None:
+        rng = np.random.default_rng(0)
+    g_after = add_conductance_variation(g_quantized, variation_sigma, rng)
+    projected[mask] = np.sign(weights[mask]) * g_after / float(c)
+    stats = _group_stats(
+        c,
+        g_before,
+        g_after,
+        g_quantized,
+        g_clipped,
+        int(np.count_nonzero(g_before < float(g_min))),
+        int(np.count_nonzero(g_before > float(g_max))),
+    )
+    return projected, stats
+
+
+def project_layers(layers, config):
+    config = config.validate()
+    if config.hardware_projection == PROJECTION_NONE:
+        return tuple(layers), {"enabled": False, "config": config.to_dict()}
+
+    rng = np.random.default_rng(int(config.variation_seed))
+    projected_layers = [
+        replace(
+            layer,
+            A_tr=np.array(layer.A_tr, dtype=np.float64, copy=True),
+            B_tr=np.array(layer.B_tr, dtype=np.float64, copy=True),
+            capacitances=np.full((layer.n_blocks, layer.state_width), np.nan, dtype=np.float64),
+        )
+        for layer in layers
+    ]
+    group_stats = []
+
+    for items in _group_items(projected_layers, config.projection_scope):
+        entries = [entry for item in items for entry in item]
+        weights = np.asarray([_read_entry(projected_layers, entry) for entry in entries], dtype=np.float64)
+        c = choose_capacitance(weights, config.g_min, config.g_max, config.c_min, config.c_max)
+        projected_items, stats = _project_items_to_conductance(
+            projected_layers,
+            items,
+            c,
+            config,
+            rng,
+        )
+        for entry, value in projected_items:
+            _write_entry(projected_layers, entry, value)
+        for entry in entries:
+            _write_capacitance(projected_layers, entry, c)
+        stats.update(_group_identity(entries))
+        group_stats.append(stats)
+
+    for layer in projected_layers:
+        caps = layer.capacitances
+        if np.isnan(caps).any():
+            caps[np.isnan(caps)] = config.c_min
+
+    report = {
+        "enabled": True,
+        "config": config.to_dict(),
+        "aggregate": _aggregate_stats(config, group_stats),
+        "layers": _layer_stats(projected_layers, group_stats),
+        "groups": group_stats,
+    }
+    return tuple(projected_layers), report
+
+
+def _project_items_to_conductance(layers, items, c, config, rng):
+    projected_items = []
+    g_before_values = []
+    g_after_values = []
+    g_quantized_values = []
+    g_clipped_values = []
+    clipped_low = 0
+    clipped_high = 0
+    for item in items:
+        values = np.asarray([_read_entry(layers, entry) for entry in item], dtype=np.float64)
+        mask = values != 0.0
+        if not np.any(mask):
+            for entry, value in zip(item, values):
+                projected_items.append((entry, float(value)))
+            continue
+        representative_abs = float(np.median(np.abs(values[mask])))
+        g_before = float(c) * representative_abs
+        g_clipped = float(np.clip(g_before, config.g_min, config.g_max))
+        g_quantized = float(quantize_conductance(np.asarray([g_clipped]), config.g_min, config.g_max, config.quant_bits, config.quant_mode)[0])
+        g_after = float(add_conductance_variation(np.asarray([g_quantized]), config.variation_sigma, rng)[0])
+        for entry, value in zip(item, values):
+            if value == 0.0:
+                projected_items.append((entry, 0.0))
+                continue
+            projected_items.append((entry, float(np.sign(value) * g_after / float(c))))
+            g_before_values.append(g_before)
+            g_clipped_values.append(g_clipped)
+            g_quantized_values.append(g_quantized)
+            g_after_values.append(g_after)
+            clipped_low += int(g_before < config.g_min)
+            clipped_high += int(g_before > config.g_max)
+    stats = _group_stats(
+        c,
+        np.asarray(g_before_values, dtype=np.float64),
+        np.asarray(g_after_values, dtype=np.float64),
+        np.asarray(g_quantized_values, dtype=np.float64),
+        np.asarray(g_clipped_values, dtype=np.float64),
+        clipped_low,
+        clipped_high,
+    )
+    return projected_items, stats
+
+
+def _entry(layer_idx, array_name, block_idx, row_idx, col_idx):
+    return {
+        "layer": int(layer_idx),
+        "array": array_name,
+        "block": int(block_idx),
+        "row": int(row_idx),
+        "col": int(col_idx),
+    }
+
+
+def _group_items(layers, scope):
+    if scope == "global":
+        return [[item for layer_idx, layer in enumerate(layers) for item in _layer_items(layer_idx, layer)]]
+    if scope == "layer":
+        return [[item for item in _layer_items(layer_idx, layer)] for layer_idx, layer in enumerate(layers)]
+    groups = []
+    for layer_idx, layer in enumerate(layers):
+        for block_idx in range(layer.n_blocks):
+            if scope == "block":
+                groups.append(_block_items(layer_idx, layer, block_idx))
+            elif scope == "row":
+                for row_idx in range(layer.state_width):
+                    groups.append(_row_items(layer_idx, layer, block_idx, row_idx))
+            else:
+                raise ValueError("projection_scope must be one of global, layer, block, row.")
+    return groups
+
+
+def _layer_items(layer_idx, layer):
+    items = []
+    for block_idx in range(layer.n_blocks):
+        items.extend(_block_items(layer_idx, layer, block_idx))
+    return items
+
+
+def _block_items(layer_idx, layer, block_idx):
+    if layer.state_width == 2:
+        items = [
+            [
+                _entry(layer_idx, "A_tr", block_idx, 0, 0),
+                _entry(layer_idx, "A_tr", block_idx, 1, 1),
+            ],
+            [
+                _entry(layer_idx, "A_tr", block_idx, 0, 1),
+                _entry(layer_idx, "A_tr", block_idx, 1, 0),
+            ],
+        ]
+    else:
+        items = [[_entry(layer_idx, "A_tr", block_idx, 0, 0)]]
+    for row_idx in range(layer.state_width):
+        for col_idx in range(layer.input_dim):
+            items.append([_entry(layer_idx, "B_tr", block_idx, row_idx, col_idx)])
+    return items
+
+
+def _row_items(layer_idx, layer, block_idx, row_idx):
+    items = []
+    for col_idx in range(layer.state_width):
+        items.append([_entry(layer_idx, "A_tr", block_idx, row_idx, col_idx)])
+    for col_idx in range(layer.input_dim):
+        items.append([_entry(layer_idx, "B_tr", block_idx, row_idx, col_idx)])
+    return items
+
+
+def _read_entry(layers, entry):
+    layer = layers[entry["layer"]]
+    array = getattr(layer, entry["array"])
+    return float(array[entry["block"], entry["row"], entry["col"]])
+
+
+def _write_entry(layers, entry, value):
+    layer = layers[entry["layer"]]
+    array = getattr(layer, entry["array"])
+    array[entry["block"], entry["row"], entry["col"]] = float(value)
+
+
+def _write_capacitance(layers, entry, capacitance):
+    layers[entry["layer"]].capacitances[entry["block"], entry["row"]] = float(capacitance)
+
+
+def _group_identity(entries):
+    layers = sorted({entry["layer"] for entry in entries})
+    blocks = sorted({entry["block"] for entry in entries})
+    rows = sorted({entry["row"] for entry in entries})
+    return {
+        "layers": layers,
+        "blocks": blocks,
+        "rows": rows,
+        "arrays": sorted({entry["array"] for entry in entries}),
+    }
+
+
+def _finite_summary(values):
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {"min": None, "median": None, "max": None}
+    return {
+        "min": float(np.min(values)),
+        "median": float(np.median(values)),
+        "max": float(np.max(values)),
+    }
+
+
+def _group_stats(c, g_before, g_after, g_quantized, g_clipped, clipped_low, clipped_high):
+    g_before = np.asarray(g_before, dtype=np.float64)
+    g_after = np.asarray(g_after, dtype=np.float64)
+    g_quantized = np.asarray(g_quantized, dtype=np.float64)
+    count = int(g_before.size)
+    return {
+        "capacitance": float(c),
+        "num_conductances": count,
+        "num_clipped_low": int(clipped_low),
+        "num_clipped_high": int(clipped_high),
+        "clip_fraction": float((clipped_low + clipped_high) / count) if count else 0.0,
+        "num_distinct_conductance_levels": int(np.unique(g_quantized).size) if g_quantized.size else 0,
+        "conductance_levels": np.unique(g_quantized).tolist() if g_quantized.size else [],
+        "g_before_min": _finite_summary(g_before)["min"],
+        "g_before_max": _finite_summary(g_before)["max"],
+        "g_before_median": _finite_summary(g_before)["median"],
+        "g_after_min": _finite_summary(g_after)["min"],
+        "g_after_max": _finite_summary(g_after)["max"],
+        "g_after_median": _finite_summary(g_after)["median"],
+        "g_clipped_min": _finite_summary(g_clipped)["min"],
+        "g_clipped_max": _finite_summary(g_clipped)["max"],
+        "g_clipped_median": _finite_summary(g_clipped)["median"],
+    }
+
+
+def _aggregate_stats(config, groups):
+    counts = np.asarray([group["num_conductances"] for group in groups], dtype=np.int64)
+    total = int(np.sum(counts)) if counts.size else 0
+    clipped_low = int(sum(group["num_clipped_low"] for group in groups))
+    clipped_high = int(sum(group["num_clipped_high"] for group in groups))
+    capacitances = [group["capacitance"] for group in groups]
+    g_before = _expand_group_values(groups, "g_before", counts)
+    g_after = _expand_group_values(groups, "g_after", counts)
+    return {
+        "g_min": float(config.g_min),
+        "g_max": float(config.g_max),
+        "c_min": float(config.c_min),
+        "c_max": float(config.c_max),
+        "quant_bits": int(config.quant_bits),
+        "quant_mode": config.quant_mode,
+        "variation_sigma": float(config.variation_sigma),
+        "num_conductances": total,
+        "num_clipped_low": clipped_low,
+        "num_clipped_high": clipped_high,
+        "clip_fraction": float((clipped_low + clipped_high) / total) if total else 0.0,
+        "num_distinct_conductance_levels": _distinct_levels(groups),
+        "capacitance_min": _finite_summary(capacitances)["min"],
+        "capacitance_max": _finite_summary(capacitances)["max"],
+        "capacitance_median": _finite_summary(capacitances)["median"],
+        "g_before_min": g_before["min"],
+        "g_before_max": g_before["max"],
+        "g_before_median": g_before["median"],
+        "g_after_min": g_after["min"],
+        "g_after_max": g_after["max"],
+        "g_after_median": g_after["median"],
+    }
+
+
+def _distinct_levels(groups):
+    levels = []
+    for group in groups:
+        levels.extend(group.get("conductance_levels", []))
+    return int(np.unique(np.asarray(levels, dtype=np.float64)).size) if levels else 0
+
+
+def _expand_group_values(groups, prefix, counts):
+    values = []
+    for group, count in zip(groups, counts):
+        median = group[f"{prefix}_median"]
+        if median is not None and int(count) > 0:
+            values.extend([median] * int(count))
+        for key in (f"{prefix}_min", f"{prefix}_max"):
+            if group[key] is not None:
+                values.append(group[key])
+    return _finite_summary(values)
+
+
+def _layer_stats(layers, groups):
+    records = []
+    for layer_idx, layer in enumerate(layers):
+        layer_groups = [group for group in groups if layer_idx in group.get("layers", [])]
+        aggregate = _aggregate_stats_for_groups(layer_groups)
+        records.append(
+            {
+                "index": int(layer_idx),
+                "path": layer.path,
+                "capacitances": np.asarray(layer.capacitances, dtype=np.float64).tolist(),
+                "aggregate": aggregate,
+                "groups": layer_groups,
+            }
+        )
+    return records
+
+
+def _aggregate_stats_for_groups(groups):
+    counts = np.asarray([group["num_conductances"] for group in groups], dtype=np.int64)
+    total = int(np.sum(counts)) if counts.size else 0
+    clipped_low = int(sum(group["num_clipped_low"] for group in groups))
+    clipped_high = int(sum(group["num_clipped_high"] for group in groups))
+    capacitances = [group["capacitance"] for group in groups]
+    g_before = _expand_group_values(groups, "g_before", counts)
+    g_after = _expand_group_values(groups, "g_after", counts)
+    return {
+        "num_conductances": total,
+        "num_clipped_low": clipped_low,
+        "num_clipped_high": clipped_high,
+        "clip_fraction": float((clipped_low + clipped_high) / total) if total else 0.0,
+        "num_distinct_conductance_levels": _distinct_levels(groups),
+        "capacitance_min": _finite_summary(capacitances)["min"],
+        "capacitance_max": _finite_summary(capacitances)["max"],
+        "capacitance_median": _finite_summary(capacitances)["median"],
+        "g_before_min": g_before["min"],
+        "g_before_max": g_before["max"],
+        "g_before_median": g_before["median"],
+        "g_after_min": g_after["min"],
+        "g_after_max": g_after["max"],
+        "g_after_median": g_after["median"],
+    }

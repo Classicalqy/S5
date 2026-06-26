@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -18,13 +18,16 @@ from .export_netlist import (
     _output_node,
     _state_node,
     add_model_header,
+    add_projection_args,
     emit_block_subckt,
     emit_output_stage,
     find_ssm_modules,
     format_spice_value,
     load_flax_params,
     module_to_layer,
+    projection_config_from_args,
 )
+from .hardware_projection import HardwareProjectionConfig, PROJECTION_NONE, project_layers
 from .trace_utils import linear_nodes
 
 
@@ -155,9 +158,20 @@ def emit_relu_stage(builder, name, source_nodes, output_prefix):
     return output_nodes
 
 
-def emit_ssm_stage(builder, layer, layer_idx, input_nodes):
+def _projection_enabled(projection_config):
+    return projection_config is not None and projection_config.hardware_projection != PROJECTION_NONE
+
+
+def emit_ssm_stage(builder, layer, layer_idx, input_nodes, state_capacitance=1e-6, use_global_state_capacitance=True):
     for block_idx in range(layer.n_blocks):
-        emit_block_subckt(builder, layer, layer_idx, block_idx, 1e-6)
+        emit_block_subckt(
+            builder,
+            layer,
+            layer_idx,
+            block_idx,
+            state_capacitance,
+            use_global_state_capacitance=use_global_state_capacitance,
+        )
     for block_idx in range(layer.n_blocks):
         pins = input_nodes + [
             _state_node(layer_idx, block_idx, state_idx)
@@ -171,10 +185,22 @@ def emit_ssm_stage(builder, layer, layer_idx, input_nodes):
     return [_output_node(layer_idx, idx) for idx in range(layer.output_dim)]
 
 
-def build_full_netlist(params, ssm_param, sample_rate):
+def build_full_netlist(params, ssm_param, sample_rate, projection_config=None):
     model = extract_full_model(params, ssm_param, sample_rate)
+    projection_report = None
+    if projection_config is None:
+        projection_config = HardwareProjectionConfig()
+    if _projection_enabled(projection_config):
+        projected_layers, projection_report = project_layers(model.ssm_layers, projection_config)
+        model = replace(model, ssm_layers=projected_layers)
+    use_global_state_capacitance = not _projection_enabled(projection_config)
     builder = NetlistBuilder()
-    add_model_header(builder, state_capacitance=1e-6, dense_included=True)
+    add_model_header(
+        builder,
+        state_capacitance=1e-6,
+        dense_included=True,
+        use_global_state_capacitance=use_global_state_capacitance,
+    )
     builder.line(f"* Full restricted model: {FULL_MODEL_TOPOLOGY}")
     builder.line(f"* Circuit semantics: {FULL_MODEL_CIRCUIT_SEMANTICS}")
     builder.line("* Note: stacked SSM layers are connected continuously, with no inter-layer sample-and-hold.")
@@ -183,9 +209,21 @@ def build_full_netlist(params, ssm_param, sample_rate):
     encoder_nodes, encoder_components = emit_linear_stage(
         builder, "ENC", input_nodes, model.encoder_kernel, model.encoder_bias, "ENC"
     )
-    ssm0_nodes = emit_ssm_stage(builder, model.ssm_layers[0], 0, encoder_nodes)
+    ssm0_nodes = emit_ssm_stage(
+        builder,
+        model.ssm_layers[0],
+        0,
+        encoder_nodes,
+        use_global_state_capacitance=use_global_state_capacitance,
+    )
     relu0_nodes = emit_relu_stage(builder, "RELU0", ssm0_nodes, "RELU0_")
-    ssm1_nodes = emit_ssm_stage(builder, model.ssm_layers[1], 1, relu0_nodes)
+    ssm1_nodes = emit_ssm_stage(
+        builder,
+        model.ssm_layers[1],
+        1,
+        relu0_nodes,
+        use_global_state_capacitance=use_global_state_capacitance,
+    )
     relu1_nodes = emit_relu_stage(builder, "RELU1", ssm1_nodes, "RELU1_")
     logit_nodes, decoder_components = emit_linear_stage(
         builder, "DEC", relu1_nodes, model.decoder_kernel, model.decoder_bias, "LOGIT"
@@ -206,17 +244,23 @@ def build_full_netlist(params, ssm_param, sample_rate):
         "encoder_components": encoder_components,
         "decoder_components": decoder_components,
     }
+    if projection_report is not None:
+        manifest["projection"] = projection_report
     return builder.render(), manifest
 
 
-def export_full_model(params_path, ssm_param, sample_rate, out_path, json_out=None):
+def export_full_model(params_path, ssm_param, sample_rate, out_path, json_out=None, projection_config=None, projection_report=None):
     params = load_flax_params(params_path)
-    netlist, manifest = build_full_netlist(params, ssm_param, sample_rate)
+    netlist, manifest = build_full_netlist(params, ssm_param, sample_rate, projection_config=projection_config)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(netlist)
     json_path = Path(json_out) if json_out else out_path.with_name(f"{out_path.stem}_components.json")
     json_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    if projection_report is not None and "projection" in manifest:
+        report_path = Path(projection_report)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(manifest["projection"], indent=2, sort_keys=True))
     return out_path, json_path
 
 
@@ -227,6 +271,7 @@ def parse_args(argv=None):
     parser.add_argument("--sample-rate", type=float, default=16000.0)
     parser.add_argument("--out", required=True)
     parser.add_argument("--json-out", default=None)
+    add_projection_args(parser)
     return parser.parse_args(argv)
 
 
@@ -238,6 +283,8 @@ def main(argv=None):
         args.sample_rate,
         args.out,
         args.json_out,
+        projection_config=projection_config_from_args(args),
+        projection_report=args.projection_report,
     )
     print(f"Wrote full-model LTSpice netlist: {cir_path}")
     print(f"Wrote full-model component manifest: {json_path}")
