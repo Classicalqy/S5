@@ -87,6 +87,22 @@ def map_nested_fn(fn):
     return map_fn
 
 
+def map_nested_with_path_fn(fn):
+    """Recursively apply `fn(path, key, value)` to leaves in a nested dict."""
+
+    def map_fn(nested_dict, path=()):
+        return {
+            k: (
+                map_fn(v, path + (k,))
+                if hasattr(v, "keys")
+                else fn(path + (k,), k, v)
+            )
+            for k, v in nested_dict.items()
+        }
+
+    return map_fn
+
+
 def maybe_unfreeze(tree):
     """Return a mutable parameter tree across Flax versions.
 
@@ -94,6 +110,28 @@ def maybe_unfreeze(tree):
     versions may already return ordinary dicts from model.init().
     """
     return tree.unfreeze() if hasattr(tree, "unfreeze") else tree
+
+
+def decoder_only_param_labels(params):
+    """Label only top-level decoder params as trainable."""
+    return map_nested_with_path_fn(
+        lambda path, _key, _value: "decoder" if path and path[0] == "decoder" else "frozen"
+    )(params)
+
+
+def create_decoder_only_optimizer(params, learning_rate):
+    labels = decoder_only_param_labels(params)
+    return optax.multi_transform(
+        {
+            "decoder": optax.adam(learning_rate=learning_rate),
+            "frozen": optax.set_to_zero(),
+        },
+        labels,
+    )
+
+
+def reset_optimizer(state, tx):
+    return state.replace(step=0, tx=tx, opt_state=tx.init(state.params))
 
 
 def create_train_state(model_cls,
@@ -371,6 +409,28 @@ def train_epoch(state, rng, model, trainloader, seq_len, in_dim, batchnorm, lr_p
 
     # Return average loss over batches
     return state, np.mean(np.array(batch_losses)), step
+
+
+def calibration_epoch(state, rng, model, trainloader, seq_len, in_dim, batchnorm):
+    """Run one fixed-LR calibration epoch without touching scheduler state."""
+    model = model(training=True)
+    batch_losses = []
+
+    for batch_idx, batch in enumerate(tqdm(trainloader)):
+        inputs, labels, integration_times = prep_batch(batch, seq_len, in_dim)
+        rng, drop_rng = jax.random.split(rng)
+        state, loss = train_step(
+            state,
+            drop_rng,
+            inputs,
+            labels,
+            integration_times,
+            model,
+            batchnorm,
+        )
+        batch_losses.append(loss)
+
+    return state, np.mean(np.array(batch_losses))
 
 
 def validate(state, model, testloader, seq_len, in_dim, batchnorm, step_rescale=1.0):

@@ -6,8 +6,18 @@ from jax.scipy.linalg import block_diag
 from flax.serialization import to_bytes
 import wandb
 
-from .train_helpers import create_train_state, reduce_lr_on_plateau,\
-    linear_warmup, cosine_annealing, constant_lr, train_epoch, validate
+from .train_helpers import (
+    calibration_epoch,
+    create_decoder_only_optimizer,
+    create_train_state,
+    linear_warmup,
+    cosine_annealing,
+    constant_lr,
+    reduce_lr_on_plateau,
+    reset_optimizer,
+    train_epoch,
+    validate,
+)
 from .dataloading import Datasets
 from .seq_model import BatchClassificationModel, RetrievalModel
 from .ssm import init_S5SSM
@@ -29,6 +39,35 @@ def save_params_msgpack(params, out_path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(to_bytes({"params": params}))
     return out_path
+
+
+def _hw_calibration_enabled(args):
+    return bool(getattr(args, "hw_calibrate_readout", False)) and int(getattr(args, "hw_calibrate_epochs", 0)) > 0
+
+
+def _hw_projection_config(args):
+    from spice.hardware_projection import HardwareProjectionConfig
+
+    return HardwareProjectionConfig(
+        hardware_projection="conductance",
+        projection_scope="block",
+        g_min=getattr(args, "hw_g_min", 1e-6),
+        g_max=getattr(args, "hw_g_max", 150e-6),
+        c_min=getattr(args, "hw_c_min", 1e-12),
+        c_max=getattr(args, "hw_c_max", 1e-6),
+        quant_bits=int(getattr(args, "hw_quant_bits", 0)),
+        quant_mode=getattr(args, "hw_quant_mode", "linear"),
+    )
+
+
+def _hw_calibrated_params_out(args):
+    path = getattr(args, "hw_calibrated_params_out", None)
+    if path:
+        return Path(path)
+
+    from spice.hardware_projector import default_projected_params_path
+
+    return default_projected_params_path(args.params_out)
 
 
 def train(args):
@@ -242,6 +281,7 @@ def train(args):
     lr_count, opt_acc = 0, -100000000.0  # This line is for learning rate decay
     step = 0  # for per step learning rate decay
     best_params = state.params
+    best_batch_stats = state.batch_stats if args.batchnorm and hasattr(state, "batch_stats") else None
     steps_per_epoch = int(train_size/args.bsz)
     for epoch in range(args.epochs):
         print(f"[*] Starting Training Epoch {epoch + 1}...")
@@ -327,6 +367,8 @@ def train(args):
             count = 0
             best_loss, best_acc, best_epoch = val_loss, val_acc, epoch
             best_params = state.params
+            if args.batchnorm and hasattr(state, "batch_stats"):
+                best_batch_stats = state.batch_stats
             if valloader is not None:
                 best_test_loss, best_test_acc = test_loss, test_acc
             else:
@@ -422,6 +464,129 @@ def train(args):
 
         if count > args.early_stop_patience:
             break
+
+    if _hw_calibration_enabled(args):
+        if not is_hardware_friendly(args.ssm_param):
+            raise ValueError("--hw_calibrate_readout requires a hardware-friendly ssm_param.")
+
+        from spice.hardware_projector import project_params_tree
+
+        print("[*] Starting hardware readout calibration from best normal-training params...")
+        projection_config = _hw_projection_config(args)
+        projected_params, projection_report = project_params_tree(
+            params=best_params,
+            ssm_param=args.ssm_param,
+            sample_rate=getattr(args, "hw_sample_rate", 16000.0),
+            projection_config=projection_config,
+        )
+        aggregate = projection_report.get("aggregate", {})
+        print(
+            "[*] Hardware projection clip fraction: {:.6f} (low={}, high={}, total={})".format(
+                aggregate.get("clip_fraction", 0.0),
+                aggregate.get("num_clipped_low", 0),
+                aggregate.get("num_clipped_high", 0),
+                aggregate.get("num_conductances", 0),
+            )
+        )
+
+        state = state.replace(params=projected_params)
+        if args.batchnorm and best_batch_stats is not None and hasattr(state, "batch_stats"):
+            state = state.replace(batch_stats=best_batch_stats)
+        state = reset_optimizer(
+            state,
+            create_decoder_only_optimizer(state.params, getattr(args, "hw_calibrate_lr", 1e-4)),
+        )
+
+        best_calibrated_params = state.params
+        best_calibrated_batch_stats = state.batch_stats if args.batchnorm and hasattr(state, "batch_stats") else None
+        best_calibrated_loss, best_calibrated_acc = 100000000, -100000000.0
+        best_calibrated_test_loss, best_calibrated_test_acc = 100000000, -100000000.0
+        best_calibrated_epoch = 0
+
+        for cal_epoch in range(int(args.hw_calibrate_epochs)):
+            print(f"[*] Starting HW Calibration Epoch {cal_epoch + 1}...")
+            train_rng, skey = random.split(train_rng)
+            state, cal_train_loss = calibration_epoch(
+                state,
+                skey,
+                model_cls,
+                trainloader,
+                seq_len,
+                in_dim,
+                args.batchnorm,
+            )
+
+            if valloader is not None:
+                print(f"[*] Running HW Calibration Epoch {cal_epoch + 1} Validation...")
+                cal_val_loss, cal_val_acc = validate(
+                    state,
+                    model_cls,
+                    valloader,
+                    seq_len,
+                    in_dim,
+                    args.batchnorm,
+                )
+                print(f"[*] Running HW Calibration Epoch {cal_epoch + 1} Test...")
+                cal_test_loss, cal_test_acc = validate(
+                    state,
+                    model_cls,
+                    testloader,
+                    seq_len,
+                    in_dim,
+                    args.batchnorm,
+                )
+            else:
+                print(f"[*] Running HW Calibration Epoch {cal_epoch + 1} Test...")
+                cal_val_loss, cal_val_acc = validate(
+                    state,
+                    model_cls,
+                    testloader,
+                    seq_len,
+                    in_dim,
+                    args.batchnorm,
+                )
+                cal_test_loss, cal_test_acc = cal_val_loss, cal_val_acc
+
+            print(f"\n=>> HW Calibration Epoch {cal_epoch + 1} Metrics ===")
+            print(
+                f"\tTrain Loss: {cal_train_loss:.5f} -- Val Loss: {cal_val_loss:.5f} --"
+                f" Test Loss: {cal_test_loss:.5f} -- Val Accuracy: {cal_val_acc:.4f}"
+                f" Test Accuracy: {cal_test_acc:.4f}"
+            )
+
+            if cal_val_acc > best_calibrated_acc:
+                best_calibrated_loss = cal_val_loss
+                best_calibrated_acc = cal_val_acc
+                best_calibrated_test_loss = cal_test_loss
+                best_calibrated_test_acc = cal_test_acc
+                best_calibrated_epoch = cal_epoch
+                best_calibrated_params = state.params
+                if args.batchnorm and hasattr(state, "batch_stats"):
+                    best_calibrated_batch_stats = state.batch_stats
+
+            wandb.log(
+                {
+                    "HW Calibration Training Loss": cal_train_loss,
+                    "HW Calibration Val loss": cal_val_loss,
+                    "HW Calibration Val Accuracy": cal_val_acc,
+                    "HW Calibration Test Loss": cal_test_loss,
+                    "HW Calibration Test Accuracy": cal_test_acc,
+                }
+            )
+
+        state = state.replace(params=best_calibrated_params)
+        if args.batchnorm and best_calibrated_batch_stats is not None and hasattr(state, "batch_stats"):
+            state = state.replace(batch_stats=best_calibrated_batch_stats)
+
+        calibrated_out = save_params_msgpack(best_calibrated_params, _hw_calibrated_params_out(args))
+        print("[*] Saved best hardware-calibrated params to {}".format(calibrated_out))
+        wandb.run.summary["HW Calibration Best Val Loss"] = best_calibrated_loss
+        wandb.run.summary["HW Calibration Best Val Accuracy"] = best_calibrated_acc
+        wandb.run.summary["HW Calibration Best Epoch"] = best_calibrated_epoch
+        wandb.run.summary["HW Calibration Best Test Loss"] = best_calibrated_test_loss
+        wandb.run.summary["HW Calibration Best Test Accuracy"] = best_calibrated_test_acc
+        wandb.run.summary["HW Calibration Params Out"] = str(calibrated_out)
+        wandb.run.summary["HW Projection Clip Fraction"] = aggregate.get("clip_fraction", 0.0)
 
     if getattr(args, "plot_ssm_diagnostics", False):
         plot_ssm_diagnostics(state.params, args)

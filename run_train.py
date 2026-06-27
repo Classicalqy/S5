@@ -93,6 +93,28 @@ if __name__ == "__main__":
 						help="save best validation params as a Flax msgpack file")
 	parser.add_argument("--params_out", type=str, default="./checkpoints/model_params.msgpack",
 						help="path for --save_params output")
+	parser.add_argument("--hw_calibrate_readout", type=str2bool, default=False,
+						help="After normal training, project best params to hardware and train only decoder/readout.")
+	parser.add_argument("--hw_calibrate_epochs", type=int, default=0,
+						help="Number of extra decoder-only hardware calibration epochs.")
+	parser.add_argument("--hw_calibrate_lr", type=float, default=1e-4,
+						help="Fixed decoder/readout learning rate during hardware calibration.")
+	parser.add_argument("--hw_sample_rate", type=float, default=16000.0,
+						help="Sample rate used to convert trained SSM params to hardware coefficients.")
+	parser.add_argument("--hw_g_min", type=float, default=1e-6,
+						help="Minimum conductance for hardware projection.")
+	parser.add_argument("--hw_g_max", type=float, default=150e-6,
+						help="Maximum conductance for hardware projection.")
+	parser.add_argument("--hw_c_min", type=float, default=1e-12,
+						help="Minimum capacitance for hardware projection.")
+	parser.add_argument("--hw_c_max", type=float, default=1e-6,
+						help="Maximum capacitance for hardware projection.")
+	parser.add_argument("--hw_quant_bits", type=int, default=0,
+						help="Conductance quantization bits during hardware projection; 0 disables quantization.")
+	parser.add_argument("--hw_quant_mode", type=str, default="linear", choices=["none", "linear", "log"],
+						help="Conductance quantization grid used when --hw_quant_bits is positive.")
+	parser.add_argument("--hw_calibrated_params_out", type=str, default=None,
+						help="Path for best hardware-calibrated params; defaults beside --params_out.")
 
 	# Optimization Parameters
 	parser.add_argument("--prenorm", type=str2bool, default=True,
