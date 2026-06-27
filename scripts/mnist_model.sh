@@ -11,7 +11,7 @@ source ~/anaconda3/etc/profile.d/conda.sh
 conda activate s5
 
 for seed in 0; do
-  for p in resonant_2x2; do
+  for p in real_decay energy_shaped_2x2 resonant_2x2; do
     echo "Running ssm_param=$p seed=$seed"
 
     python run_train.py \
@@ -31,6 +31,9 @@ for seed in 0; do
       epochs=20 \
       seed=$seed \
       save_params=True \
+      hw_calibrate_readout=True \
+      hw_calibrate_epochs=5 \
+      hw_caligrate_lr=1e-4 \
       params_out=checkpoints/mnist_${p}_seed${seed}_params.msgpack
   done
 done
