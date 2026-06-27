@@ -33,7 +33,7 @@ for seed in 0; do
       save_params=True \
       hw_calibrate_readout=True \
       hw_calibrate_epochs=5 \
-      hw_caligrate_lr=1e-4 \
+      hw_calibrate_lr=1e-4 \
       params_out=checkpoints/mnist_${p}_seed${seed}_params.msgpack
   done
 done
