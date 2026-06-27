@@ -24,12 +24,14 @@ from spice.export_netlist import (
     module_to_layer,
     positive,
 )
+from spice.hardware_projector import default_projected_params_path, project_params_tree
 from spice.hardware_projection import (
     HardwareProjectionConfig,
     project_layers,
     project_signed_weights_to_conductance,
     quantize_conductance,
 )
+from spice.projected_params import save_projected_params as compat_save_projected_params
 from spice.metrics import trace_metrics
 from spice.plots import trace_line_style
 from spice.trace_utils import zoh_pwl_source_line
@@ -357,6 +359,53 @@ def test_full_alignment_state_trace_rescale_uses_projection_report():
 
     np.testing.assert_allclose(rescaled["L0_B0_x0"], np.array([1.0, 2.0]))
     np.testing.assert_allclose(rescaled["LOGIT0"], trace["LOGIT0"])
+
+
+def test_hardware_projector_projects_params_tree_and_default_path():
+    params = _nested_params(_single_ssm_params())
+
+    projected, report = project_params_tree(
+        params,
+        "resonant_2x2",
+        sample_rate=10.0,
+        projection_config=HardwareProjectionConfig(
+            hardware_projection="conductance",
+            g_min=1e-6,
+            g_max=1e-4,
+            c_min=1e-9,
+            c_max=1e-6,
+            quant_bits=0,
+        ),
+    )
+
+    assert "encoder" in projected
+    assert report["enabled"] is True
+    assert default_projected_params_path("checkpoints/model_params.msgpack").name == "model_params_projected.msgpack"
+
+
+def test_projected_params_compat_save_projected_params_still_resolves(tmp_path):
+    params = _nested_params(_single_ssm_params())
+    params_path = save_params_msgpack(params, tmp_path / "params.msgpack")
+    out_path = tmp_path / "projected.msgpack"
+
+    saved_path, report = compat_save_projected_params(
+        params_path,
+        "resonant_2x2",
+        10.0,
+        HardwareProjectionConfig(
+            hardware_projection="conductance",
+            g_min=1e-6,
+            g_max=1e-4,
+            c_min=1e-9,
+            c_max=1e-6,
+            quant_bits=0,
+        ),
+        out_path,
+    )
+
+    assert saved_path == out_path
+    assert out_path.exists()
+    assert report["enabled"] is True
 
 
 def test_projected_manifest_records_stats_and_capacitances():

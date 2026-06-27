@@ -23,7 +23,7 @@ from .export_netlist import (
 from .hardware_projection import HardwareProjectionConfig
 from .metrics import rrmse, trace_metrics
 from .plots import plot_logit_bar, plot_multi_logit_bar, plot_multi_trace_overlay, plot_trace_overlay
-from .projected_params import save_projected_params
+from .hardware_projector import save_projected_params
 from .trace_utils import linear_nodes
 from .validate_digital_alignment import (
     alignment_nodes,
