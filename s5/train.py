@@ -492,6 +492,57 @@ def train(args):
         state = state.replace(params=projected_params)
         if args.batchnorm and best_batch_stats is not None and hasattr(state, "batch_stats"):
             state = state.replace(batch_stats=best_batch_stats)
+
+        if valloader is not None:
+            print("[*] Running projected hardware params Validation before decoder calibration...")
+            projected_val_loss, projected_val_acc = validate(
+                state,
+                model_cls,
+                valloader,
+                seq_len,
+                in_dim,
+                args.batchnorm,
+            )
+            print("[*] Running projected hardware params Test before decoder calibration...")
+            projected_test_loss, projected_test_acc = validate(
+                state,
+                model_cls,
+                testloader,
+                seq_len,
+                in_dim,
+                args.batchnorm,
+            )
+        else:
+            print("[*] Running projected hardware params Test before decoder calibration...")
+            projected_val_loss, projected_val_acc = validate(
+                state,
+                model_cls,
+                testloader,
+                seq_len,
+                in_dim,
+                args.batchnorm,
+            )
+            projected_test_loss, projected_test_acc = projected_val_loss, projected_val_acc
+
+        print("\n=>> Projected Hardware Params Metrics Before Decoder Calibration ===")
+        print(
+            f"\tVal Loss: {projected_val_loss:.5f} -- Test Loss: {projected_test_loss:.5f} --"
+            f" Val Accuracy: {projected_val_acc:.4f}"
+            f" Test Accuracy: {projected_test_acc:.4f}"
+        )
+        wandb.log(
+            {
+                "HW Projected Val loss": projected_val_loss,
+                "HW Projected Val Accuracy": projected_val_acc,
+                "HW Projected Test Loss": projected_test_loss,
+                "HW Projected Test Accuracy": projected_test_acc,
+            }
+        )
+        wandb.run.summary["HW Projected Val Loss"] = projected_val_loss
+        wandb.run.summary["HW Projected Val Accuracy"] = projected_val_acc
+        wandb.run.summary["HW Projected Test Loss"] = projected_test_loss
+        wandb.run.summary["HW Projected Test Accuracy"] = projected_test_acc
+
         state = reset_optimizer(
             state,
             create_decoder_only_optimizer(state.params, getattr(args, "hw_calibrate_lr", 1e-4)),
