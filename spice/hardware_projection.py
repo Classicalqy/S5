@@ -11,6 +11,8 @@ PROJECTION_NONE = "none"
 PROJECTION_CONDUCTANCE = "conductance"
 PROJECTION_SCOPES = {"global", "layer", "block", "row"}
 QUANT_MODES = {"none", "linear", "log"}
+DENSE_BOUNDARY_SCALE_MIN = 0.25
+DENSE_BOUNDARY_SCALE_MAX = 4.0
 
 
 @dataclass(frozen=True)
@@ -125,6 +127,143 @@ def project_signed_weights_to_conductance(weights, c, g_min, g_max, quant_bits=0
         int(np.count_nonzero(g_before > float(g_max))),
     )
     return projected, stats
+
+
+def project_dense_weights_to_conductance(weights, config, feedback_resistance, rng=None):
+    """Project dense weights through G = |w|/Rf and w = sign(w)*G*Rf."""
+    config = config.validate()
+    weights = np.asarray(weights, dtype=np.float64)
+    projected = weights.copy()
+    mask = weights != 0.0
+    g_before = np.abs(weights[mask]) / float(feedback_resistance)
+    if g_before.size == 0:
+        return projected, _dense_group_stats(feedback_resistance, g_before, g_before, g_before, g_before, 0, 0)
+
+    low = g_before < float(config.g_min)
+    high = g_before > float(config.g_max)
+    in_range = ~(low | high)
+    g_clipped = np.where(low, 0.0, np.minimum(g_before, float(config.g_max)))
+    g_quantized = g_clipped.copy()
+    g_quantized[in_range] = quantize_conductance(
+        g_clipped[in_range],
+        config.g_min,
+        config.g_max,
+        config.quant_bits,
+        config.quant_mode,
+    )
+    g_quantized[high] = quantize_conductance(
+        np.asarray([float(config.g_max)]),
+        config.g_min,
+        config.g_max,
+        config.quant_bits,
+        config.quant_mode,
+    )[0]
+    if rng is None:
+        rng = np.random.default_rng(0)
+    g_after = g_quantized.copy()
+    nonzero_g = g_after > 0.0
+    g_after[nonzero_g] = add_conductance_variation(g_after[nonzero_g], config.variation_sigma, rng)
+    projected[mask] = np.sign(weights[mask]) * g_after * float(feedback_resistance)
+    stats = _dense_group_stats(
+        feedback_resistance,
+        g_before,
+        g_after,
+        g_quantized,
+        g_clipped,
+        int(np.count_nonzero(low)),
+        int(np.count_nonzero(high)),
+    )
+    return projected, stats
+
+
+def choose_dense_weight_scale(
+    weights,
+    config,
+    feedback_resistance,
+    scale_min=DENSE_BOUNDARY_SCALE_MIN,
+    scale_max=DENSE_BOUNDARY_SCALE_MAX,
+):
+    """Choose a positive scale that moves dense weights toward the conductance window."""
+    config = config.validate()
+    weights = np.abs(np.asarray(weights, dtype=np.float64))
+    weights = weights[weights > 0.0]
+    if weights.size == 0:
+        return 1.0, {
+            "num_weights": 0,
+            "scale": 1.0,
+            "clip_fraction_before": 0.0,
+            "clip_fraction_after": 0.0,
+            "num_clipped_before": 0,
+            "num_clipped_after": 0,
+        }
+
+    min_weight = float(config.g_min) * float(feedback_resistance)
+    max_weight = float(config.g_max) * float(feedback_resistance)
+    lower = min_weight / weights
+    upper = max_weight / weights
+    bounds = np.concatenate([lower, upper, np.asarray([1.0])])
+    bounds = bounds[np.isfinite(bounds) & (bounds > 0.0)]
+    bounds = np.unique(bounds)
+    bounds.sort()
+    scale_min = float(scale_min)
+    scale_max = float(scale_max)
+    candidates = [1.0, scale_min, scale_max]
+    candidates.extend(np.clip(bounds, scale_min, scale_max).tolist())
+    if bounds.size > 1:
+        candidates.extend(np.clip(np.sqrt(bounds[:-1] * bounds[1:]), scale_min, scale_max).tolist())
+
+    def score(scale):
+        scaled = weights * float(scale)
+        low = scaled < min_weight
+        high = scaled > max_weight
+        clipped = np.clip(scaled, min_weight, max_weight)
+        log_error = float(np.mean(np.abs(np.log(clipped / scaled))))
+        return (
+            int(np.count_nonzero(low) + np.count_nonzero(high)),
+            int(np.count_nonzero(high)),
+            int(np.count_nonzero(low)),
+            log_error,
+            abs(np.log(float(scale))),
+        )
+
+    before = score(1.0)
+    best_scale = min((float(c) for c in candidates if np.isfinite(c) and c > 0.0), key=score)
+    after = score(best_scale)
+    return best_scale, {
+        "num_weights": int(weights.size),
+        "scale": float(best_scale),
+        "clip_fraction_before": float(before[0] / weights.size),
+        "clip_fraction_after": float(after[0] / weights.size),
+        "num_clipped_before": int(before[0]),
+        "num_clipped_after": int(after[0]),
+    }
+
+
+def project_dense_layers(dense_layers, config, feedback_resistance):
+    """Project named dense kernels and return projected kernels plus a report."""
+    config = config.validate()
+    if config.hardware_projection == PROJECTION_NONE:
+        return {name: np.asarray(kernel, dtype=np.float64).copy() for name, kernel in dense_layers}, {
+            "enabled": False,
+            "config": config.to_dict(),
+        }
+
+    rng = np.random.default_rng(int(config.variation_seed))
+    projected = {}
+    groups = []
+    for name, kernel in dense_layers:
+        mapped, stats = project_dense_weights_to_conductance(kernel, config, feedback_resistance, rng=rng)
+        stats["name"] = name
+        projected[name] = mapped
+        groups.append(stats)
+
+    return projected, {
+        "enabled": True,
+        "config": config.to_dict(),
+        "feedback_resistance": float(feedback_resistance),
+        "aggregate": _aggregate_dense_stats(config, groups, feedback_resistance),
+        "groups": groups,
+    }
 
 
 def project_layers(layers, config):
@@ -497,6 +636,31 @@ def _group_stats(c, g_before, g_after, g_quantized, g_clipped, clipped_low, clip
     }
 
 
+def _dense_group_stats(feedback_resistance, g_before, g_after, g_quantized, g_clipped, clipped_low, clipped_high):
+    g_before = np.asarray(g_before, dtype=np.float64)
+    g_after = np.asarray(g_after, dtype=np.float64)
+    g_quantized = np.asarray(g_quantized, dtype=np.float64)
+    count = int(g_before.size)
+    return {
+        "feedback_resistance": float(feedback_resistance),
+        "num_conductances": count,
+        "num_clipped_low": int(clipped_low),
+        "num_clipped_high": int(clipped_high),
+        "clip_fraction": float((clipped_low + clipped_high) / count) if count else 0.0,
+        "num_distinct_conductance_levels": int(np.unique(g_quantized).size) if g_quantized.size else 0,
+        "conductance_levels": np.unique(g_quantized).tolist() if g_quantized.size else [],
+        "g_before_min": _finite_summary(g_before)["min"],
+        "g_before_max": _finite_summary(g_before)["max"],
+        "g_before_median": _finite_summary(g_before)["median"],
+        "g_after_min": _finite_summary(g_after)["min"],
+        "g_after_max": _finite_summary(g_after)["max"],
+        "g_after_median": _finite_summary(g_after)["median"],
+        "g_clipped_min": _finite_summary(g_clipped)["min"],
+        "g_clipped_max": _finite_summary(g_clipped)["max"],
+        "g_clipped_median": _finite_summary(g_clipped)["median"],
+    }
+
+
 def _aggregate_stats(config, groups):
     counts = np.asarray([group["num_conductances"] for group in groups], dtype=np.int64)
     total = int(np.sum(counts)) if counts.size else 0
@@ -521,6 +685,34 @@ def _aggregate_stats(config, groups):
         "capacitance_min": _finite_summary(capacitances)["min"],
         "capacitance_max": _finite_summary(capacitances)["max"],
         "capacitance_median": _finite_summary(capacitances)["median"],
+        "g_before_min": g_before["min"],
+        "g_before_max": g_before["max"],
+        "g_before_median": g_before["median"],
+        "g_after_min": g_after["min"],
+        "g_after_max": g_after["max"],
+        "g_after_median": g_after["median"],
+    }
+
+
+def _aggregate_dense_stats(config, groups, feedback_resistance):
+    counts = np.asarray([group["num_conductances"] for group in groups], dtype=np.int64)
+    total = int(np.sum(counts)) if counts.size else 0
+    clipped_low = int(sum(group["num_clipped_low"] for group in groups))
+    clipped_high = int(sum(group["num_clipped_high"] for group in groups))
+    g_before = _expand_group_values(groups, "g_before", counts)
+    g_after = _expand_group_values(groups, "g_after", counts)
+    return {
+        "g_min": float(config.g_min),
+        "g_max": float(config.g_max),
+        "quant_bits": int(config.quant_bits),
+        "quant_mode": config.quant_mode,
+        "variation_sigma": float(config.variation_sigma),
+        "feedback_resistance": float(feedback_resistance),
+        "num_conductances": total,
+        "num_clipped_low": clipped_low,
+        "num_clipped_high": clipped_high,
+        "clip_fraction": float((clipped_low + clipped_high) / total) if total else 0.0,
+        "num_distinct_conductance_levels": _distinct_levels(groups),
         "g_before_min": g_before["min"],
         "g_before_max": g_before["max"],
         "g_before_median": g_before["median"],

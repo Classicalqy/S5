@@ -27,7 +27,13 @@ from .export_netlist import (
     module_to_layer,
     projection_config_from_args,
 )
-from .hardware_projection import HardwareProjectionConfig, PROJECTION_NONE, project_layers
+from .hardware_projection import (
+    HardwareProjectionConfig,
+    PROJECTION_NONE,
+    choose_dense_weight_scale,
+    project_dense_layers,
+    project_layers,
+)
 from .trace_utils import linear_nodes
 
 
@@ -122,13 +128,15 @@ def emit_linear_stage(builder, name, source_nodes, kernel, bias, output_prefix):
 
         if bias[out_idx] != 0.0:
             bias_node = f"{out_node}_bias"
+            bias_resistance = DEFAULT_FEEDBACK_RESISTANCE / abs(bias[out_idx])
+            bias_source = -1.0 if bias[out_idx] > 0.0 else 1.0
             builder.component(
                 f"V_{name}_BIAS_{out_idx}",
-                f"V_{name}_BIAS_{out_idx} {bias_node} 0 {format_spice_value(-bias[out_idx])}",
+                f"V_{name}_BIAS_{out_idx} {bias_node} 0 {format_spice_value(bias_source)}",
             )
             builder.component(
                 f"R_{name}_BIAS_{out_idx}",
-                f"R_{name}_BIAS_{out_idx} {bias_node} {sum_node} {format_spice_value(DEFAULT_FEEDBACK_RESISTANCE)}",
+                f"R_{name}_BIAS_{out_idx} {bias_node} {sum_node} {format_spice_value(bias_resistance)}",
             )
             components.extend([f"V_{name}_BIAS_{out_idx}", f"R_{name}_BIAS_{out_idx}"])
 
@@ -162,6 +170,79 @@ def _projection_enabled(projection_config):
     return projection_config is not None and projection_config.hardware_projection != PROJECTION_NONE
 
 
+def _apply_dense_boundary_rescale(model, projection_config):
+    ssm_layers = list(model.ssm_layers)
+    records = []
+
+    if ssm_layers:
+        encoder_kernel = np.array(model.encoder_kernel, dtype=np.float64, copy=True)
+        encoder_bias = np.array(model.encoder_bias, dtype=np.float64, copy=True)
+        first = ssm_layers[0]
+        first_b = np.array(first.B, dtype=np.float64, copy=True)
+        first_b_tr = np.array(first.B_tr, dtype=np.float64, copy=True)
+        if (
+            encoder_kernel.ndim == 2
+            and encoder_bias.ndim == 1
+            and first_b.ndim == 2
+            and encoder_kernel.shape[1] == encoder_bias.shape[0] == first_b.shape[1]
+        ):
+            for idx in range(encoder_kernel.shape[1]):
+                scale, record = choose_dense_weight_scale(
+                    np.concatenate([encoder_kernel[:, idx], np.asarray([encoder_bias[idx]])]),
+                    projection_config,
+                    DEFAULT_FEEDBACK_RESISTANCE,
+                )
+                encoder_kernel[:, idx] *= scale
+                encoder_bias[idx] *= scale
+                first_b[:, idx] /= scale
+                first_b_tr[:, :, idx] /= scale
+                record.update({"boundary": "encoder_to_ssm0", "channel": int(idx)})
+                records.append(record)
+            ssm_layers[0] = replace(first, B=first_b, B_tr=first_b_tr)
+    else:
+        encoder_kernel = model.encoder_kernel
+        encoder_bias = model.encoder_bias
+
+    if ssm_layers:
+        decoder_kernel = np.array(model.decoder_kernel, dtype=np.float64, copy=True)
+        last = ssm_layers[-1]
+        last_c = np.array(last.C, dtype=np.float64, copy=True)
+        if last_c.ndim == 2 and decoder_kernel.ndim == 2 and last_c.shape[0] == decoder_kernel.shape[0]:
+            for idx in range(decoder_kernel.shape[0]):
+                scale, record = choose_dense_weight_scale(
+                    decoder_kernel[idx, :],
+                    projection_config,
+                    DEFAULT_FEEDBACK_RESISTANCE,
+                )
+                decoder_kernel[idx, :] *= scale
+                last_c[idx, :] /= scale
+                record.update({"boundary": "ssm_last_to_decoder", "channel": int(idx)})
+                records.append(record)
+            ssm_layers[-1] = replace(last, C=last_c)
+    else:
+        decoder_kernel = model.decoder_kernel
+
+    scales = [record["scale"] for record in records]
+    report = {
+        "enabled": bool(records),
+        "feedback_resistance": float(DEFAULT_FEEDBACK_RESISTANCE),
+        "scale_min": float(np.min(scales)) if scales else None,
+        "scale_median": float(np.median(scales)) if scales else None,
+        "scale_max": float(np.max(scales)) if scales else None,
+        "num_boundaries": int(len(records)),
+        "num_clipped_before": int(sum(record["num_clipped_before"] for record in records)),
+        "num_clipped_after": int(sum(record["num_clipped_after"] for record in records)),
+        "records": records,
+    }
+    return replace(
+        model,
+        encoder_kernel=encoder_kernel,
+        encoder_bias=encoder_bias,
+        ssm_layers=tuple(ssm_layers),
+        decoder_kernel=decoder_kernel,
+    ), report
+
+
 def emit_ssm_stage(builder, layer, layer_idx, input_nodes, state_capacitance=1e-6, use_global_state_capacitance=True):
     for block_idx in range(layer.n_blocks):
         emit_block_subckt(
@@ -191,8 +272,28 @@ def build_full_netlist(params, ssm_param, sample_rate, projection_config=None):
     if projection_config is None:
         projection_config = HardwareProjectionConfig()
     if _projection_enabled(projection_config):
+        model, dense_rescale_report = _apply_dense_boundary_rescale(model, projection_config)
         projected_layers, projection_report = project_layers(model.ssm_layers, projection_config)
-        model = replace(model, ssm_layers=projected_layers)
+        projected_dense, dense_report = project_dense_layers(
+            [
+                ("encoder", model.encoder_kernel),
+                ("encoder_bias", model.encoder_bias),
+                ("decoder", model.decoder_kernel),
+                ("decoder_bias", model.decoder_bias),
+            ],
+            projection_config,
+            DEFAULT_FEEDBACK_RESISTANCE,
+        )
+        projection_report["dense_rescale"] = dense_rescale_report
+        projection_report["dense"] = dense_report
+        model = replace(
+            model,
+            encoder_kernel=projected_dense["encoder"],
+            encoder_bias=projected_dense["encoder_bias"],
+            ssm_layers=projected_layers,
+            decoder_kernel=projected_dense["decoder"],
+            decoder_bias=projected_dense["decoder_bias"],
+        )
     use_global_state_capacitance = not _projection_enabled(projection_config)
     builder = NetlistBuilder()
     add_model_header(

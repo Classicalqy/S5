@@ -17,6 +17,7 @@ from spice.export_full_model import (
     extract_full_model,
 )
 from spice.export_netlist import (
+    DEFAULT_FEEDBACK_RESISTANCE,
     NetlistBuilder,
     build_netlist,
     find_ssm_modules,
@@ -383,6 +384,48 @@ def test_hardware_projector_projects_params_tree_and_default_path():
     assert default_projected_params_path("checkpoints/model_params.msgpack").name == "model_params_projected.msgpack"
 
 
+def test_hardware_projector_projects_exported_dense_params():
+    params = _full_model_params()
+    params["encoder"]["encoder"]["kernel"] = np.array([[0.001, 2.0]], dtype=np.float32)
+    params["decoder"]["kernel"] = np.array(
+        [[-0.001, 2.0, 0.1], [0.02, -3.0, -0.5]],
+        dtype=np.float32,
+    )
+
+    projected, report = project_params_tree(
+        params,
+        "resonant_2x2",
+        sample_rate=10.0,
+        projection_config=HardwareProjectionConfig(
+            hardware_projection="conductance",
+            g_min=1e-6,
+            g_max=150e-6,
+            c_min=1e-9,
+            c_max=1e-6,
+            quant_bits=0,
+        ),
+    )
+
+    max_weight = DEFAULT_FEEDBACK_RESISTANCE * 150e-6
+    assert projected["encoder"]["encoder"]["kernel"][0, 0] == 0.0
+    np.testing.assert_allclose(projected["encoder"]["encoder"]["kernel"][0, 1], max_weight)
+    assert projected["decoder"]["kernel"][0, 0] == 0.0
+    np.testing.assert_allclose(projected["decoder"]["kernel"][0, 1], max_weight)
+    np.testing.assert_allclose(projected["decoder"]["kernel"][1, 1], -max_weight)
+    np.testing.assert_allclose(projected["encoder"]["encoder"]["bias"], np.array([0.4, -0.15], dtype=np.float32))
+    np.testing.assert_allclose(projected["decoder"]["bias"], np.array([0.0, -0.02, 0.03], dtype=np.float32))
+    assert report["dense_rescale"]["num_clipped_before"] == 5
+    assert report["dense_rescale"]["num_clipped_after"] == 3
+    assert report["dense"]["aggregate"]["num_clipped_low"] == 4
+    assert report["dense"]["aggregate"]["num_clipped_high"] == 0
+    assert {group["name"] for group in report["dense"]["groups"]} == {
+        "encoder",
+        "encoder_bias",
+        "decoder",
+        "decoder_bias",
+    }
+
+
 def test_projected_params_compat_save_projected_params_still_resolves(tmp_path):
     params = _nested_params(_single_ssm_params())
     params_path = save_params_msgpack(params, tmp_path / "params.msgpack")
@@ -583,8 +626,10 @@ def test_linear_stage_signs_and_bias_are_explicit():
     assert outputs == ["OUT0", "OUT1"]
     assert "XINV_TEST_0_0 SRC0 SRC0_inv_TEST_0 unity_inverter" in netlist
     assert "R_TEST_1_0 SRC0 OUT1_sum" in netlist
-    assert "V_TEST_BIAS_0 OUT0_bias 0 -0.5" in netlist
-    assert "V_TEST_BIAS_1 OUT1_bias 0 0.25" in netlist
+    assert "V_TEST_BIAS_0 OUT0_bias 0 -1" in netlist
+    assert "R_TEST_BIAS_0 OUT0_bias OUT0_sum 20000" in netlist
+    assert "V_TEST_BIAS_1 OUT1_bias 0 1" in netlist
+    assert "R_TEST_BIAS_1 OUT1_bias OUT1_sum 40000" in netlist
 
 
 def test_full_model_exporter_rejects_missing_decoder():
@@ -609,6 +654,48 @@ def test_full_model_manifest_records_continuous_cascade_semantics():
     assert "continuous_cascade_without_inter_layer_sample_hold" in netlist
     assert manifest["circuit_semantics"] == "continuous_cascade_without_inter_layer_sample_hold"
     assert "activation_fn=relu" in manifest["assumptions"]
+
+
+def test_full_model_projection_clips_encoder_decoder_conductances_and_biases():
+    params = _full_model_params()
+    params["encoder"]["encoder"]["kernel"] = np.array([[0.001, 2.0]], dtype=np.float32)
+    params["decoder"]["kernel"] = np.array(
+        [[-0.001, 2.0, 0.1], [0.02, -3.0, -0.5]],
+        dtype=np.float32,
+    )
+
+    netlist, manifest = build_full_netlist(
+        params,
+        "resonant_2x2",
+        sample_rate=10.0,
+        projection_config=HardwareProjectionConfig(
+            hardware_projection="conductance",
+            g_min=1e-6,
+            g_max=150e-6,
+            c_min=1e-9,
+            c_max=1e-6,
+            quant_bits=0,
+        ),
+    )
+
+    dense_report = manifest["projection"]["dense"]["aggregate"]
+    rescale_report = manifest["projection"]["dense_rescale"]
+    assert rescale_report["num_clipped_before"] == 5
+    assert rescale_report["num_clipped_after"] == 3
+    assert dense_report["num_clipped_low"] == 4
+    assert dense_report["num_clipped_high"] == 0
+    assert {group["name"] for group in manifest["projection"]["dense"]["groups"]} == {
+        "encoder",
+        "encoder_bias",
+        "decoder",
+        "decoder_bias",
+    }
+    assert "R_ENC_0_0" not in netlist
+    assert "R_DEC_0_0" not in netlist
+    assert "R_DEC_BIAS_0" not in netlist
+    assert "V_DEC_BIAS_1 LOGIT1_bias 0 1" in netlist
+    assert "R_ENC_1_0" in netlist
+    assert "6666.66666667" in netlist
 
 
 def test_digital_discrete_matrices_match_training_zoh_discretizer():
