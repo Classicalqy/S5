@@ -1,4 +1,5 @@
 # Figures
+.DS_Store
 figs/
 results/
 checkpoints/
