@@ -13,6 +13,9 @@ SSM_PARAMETER_NAMES = [
     "raw_alpha", "omega", "raw_q",
 ]
 SSM_WITH_C_PARAMETER_NAMES = SSM_PARAMETER_NAMES + ["C", "C1", "C2", "D"]
+ANALOG_CALIBRATION_SSM_PARAMETER_NAMES = {
+    "B", "C", "raw_alpha", "omega", "raw_q", "log_step",
+}
 
 
 # LR schedulers
@@ -119,6 +122,23 @@ def decoder_only_param_labels(params):
     )(params)
 
 
+def analog_calibration_param_labels(params):
+    """Label hardware-realizable analog params as trainable."""
+
+    def label(path, key, _value):
+        if path and path[0] == "decoder":
+            return "analog"
+        if path[:2] == ("encoder", "encoder") or (
+            path and path[0] == "encoder" and len(path) == 2
+        ):
+            return "analog"
+        if key in ANALOG_CALIBRATION_SSM_PARAMETER_NAMES:
+            return "analog"
+        return "frozen"
+
+    return map_nested_with_path_fn(label)(params)
+
+
 def create_decoder_only_optimizer(params, learning_rate):
     labels = decoder_only_param_labels(params)
     return optax.multi_transform(
@@ -128,6 +148,25 @@ def create_decoder_only_optimizer(params, learning_rate):
         },
         labels,
     )
+
+
+def create_analog_calibration_optimizer(params, learning_rate):
+    labels = analog_calibration_param_labels(params)
+    return optax.multi_transform(
+        {
+            "analog": optax.adam(learning_rate=learning_rate),
+            "frozen": optax.set_to_zero(),
+        },
+        labels,
+    )
+
+
+def create_hw_calibration_optimizer(params, learning_rate, mode):
+    if mode == "readout":
+        return create_decoder_only_optimizer(params, learning_rate)
+    if mode == "analog":
+        return create_analog_calibration_optimizer(params, learning_rate)
+    raise ValueError(f"Unknown hardware calibration mode: {mode}")
 
 
 def reset_optimizer(state, tx):

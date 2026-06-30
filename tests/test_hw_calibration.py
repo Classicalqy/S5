@@ -1,7 +1,12 @@
 import jax.numpy as np
+import pytest
 
 from s5.train import _hw_calibration_enabled, _hw_calibrated_params_out
-from s5.train_helpers import decoder_only_param_labels
+from s5.train_helpers import (
+    analog_calibration_param_labels,
+    create_hw_calibration_optimizer,
+    decoder_only_param_labels,
+)
 
 
 class Args:
@@ -24,6 +29,53 @@ def test_decoder_only_param_labels_train_only_top_level_decoder():
     assert labels["layers_0"]["seq"]["B"] == "frozen"
     assert labels["layers_0"]["seq"]["C"] == "frozen"
     assert labels["decoder_aux"]["kernel"] == "frozen"
+
+
+def test_analog_param_labels_train_hardware_realizable_params():
+    params = {
+        "encoder": {
+            "encoder": {"kernel": np.ones((1, 2)), "bias": np.ones((2,))},
+            "layers_0": {
+                "seq": {
+                    "B": np.ones((2, 2)),
+                    "C": np.ones((2, 2)),
+                    "raw_alpha": np.ones((1,)),
+                    "omega": np.ones((1,)),
+                    "raw_q": np.ones((1,)),
+                    "log_step": np.ones((1, 1)),
+                    "Lambda_re": np.ones((1,)),
+                },
+                "norm": {"scale": np.ones((2,))},
+                "out2": {"kernel": np.ones((2, 2))},
+            },
+        },
+        "decoder": {"kernel": np.ones((2, 3)), "bias": np.ones((3,))},
+        "decoder_aux": {"kernel": np.ones((2, 3))},
+    }
+
+    labels = analog_calibration_param_labels(params)
+
+    assert labels["encoder"]["encoder"]["kernel"] == "analog"
+    assert labels["encoder"]["encoder"]["bias"] == "analog"
+    assert labels["decoder"]["kernel"] == "analog"
+    assert labels["decoder"]["bias"] == "analog"
+    assert labels["encoder"]["layers_0"]["seq"]["B"] == "analog"
+    assert labels["encoder"]["layers_0"]["seq"]["C"] == "analog"
+    assert labels["encoder"]["layers_0"]["seq"]["raw_alpha"] == "analog"
+    assert labels["encoder"]["layers_0"]["seq"]["omega"] == "analog"
+    assert labels["encoder"]["layers_0"]["seq"]["raw_q"] == "analog"
+    assert labels["encoder"]["layers_0"]["seq"]["log_step"] == "analog"
+    assert labels["encoder"]["layers_0"]["seq"]["Lambda_re"] == "frozen"
+    assert labels["encoder"]["layers_0"]["norm"]["scale"] == "frozen"
+    assert labels["encoder"]["layers_0"]["out2"]["kernel"] == "frozen"
+    assert labels["decoder_aux"]["kernel"] == "frozen"
+
+
+def test_hw_calibration_optimizer_rejects_unknown_mode():
+    params = {"decoder": {"kernel": np.ones((2, 3))}}
+
+    with pytest.raises(ValueError, match="Unknown hardware calibration mode"):
+        create_hw_calibration_optimizer(params, 1e-4, "unknown")
 
 
 def test_hw_calibration_gate_requires_flag_and_epochs():

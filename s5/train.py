@@ -8,7 +8,7 @@ import wandb
 
 from .train_helpers import (
     calibration_epoch,
-    create_decoder_only_optimizer,
+    create_hw_calibration_optimizer,
     create_train_state,
     linear_warmup,
     cosine_annealing,
@@ -471,7 +471,12 @@ def train(args):
 
         from spice.hardware_projector import project_params_tree
 
-        print("[*] Starting hardware readout calibration from best normal-training params...")
+        hw_calibrate_mode = getattr(args, "hw_calibrate_mode", "readout")
+        hw_project_each_epoch = bool(getattr(args, "hw_project_each_calibration_epoch", True))
+        if hw_calibrate_mode not in {"readout", "analog"}:
+            raise ValueError("--hw_calibrate_mode must be one of: readout, analog.")
+
+        print(f"[*] Starting hardware {hw_calibrate_mode} calibration from best normal-training params...")
         projection_config = _hw_projection_config(args)
         projected_params, projection_report = project_params_tree(
             params=best_params,
@@ -494,7 +499,7 @@ def train(args):
             state = state.replace(batch_stats=best_batch_stats)
 
         if valloader is not None:
-            print("[*] Running projected hardware params Validation before decoder calibration...")
+            print(f"[*] Running projected hardware params Validation before {hw_calibrate_mode} calibration...")
             projected_val_loss, projected_val_acc = validate(
                 state,
                 model_cls,
@@ -503,7 +508,7 @@ def train(args):
                 in_dim,
                 args.batchnorm,
             )
-            print("[*] Running projected hardware params Test before decoder calibration...")
+            print(f"[*] Running projected hardware params Test before {hw_calibrate_mode} calibration...")
             projected_test_loss, projected_test_acc = validate(
                 state,
                 model_cls,
@@ -513,7 +518,7 @@ def train(args):
                 args.batchnorm,
             )
         else:
-            print("[*] Running projected hardware params Test before decoder calibration...")
+            print(f"[*] Running projected hardware params Test before {hw_calibrate_mode} calibration...")
             projected_val_loss, projected_val_acc = validate(
                 state,
                 model_cls,
@@ -524,7 +529,7 @@ def train(args):
             )
             projected_test_loss, projected_test_acc = projected_val_loss, projected_val_acc
 
-        print("\n=>> Projected Hardware Params Metrics Before Decoder Calibration ===")
+        print(f"\n=>> Projected Hardware Params Metrics Before {hw_calibrate_mode.capitalize()} Calibration ===")
         print(
             f"\tVal Loss: {projected_val_loss:.5f} -- Test Loss: {projected_test_loss:.5f} --"
             f" Val Accuracy: {projected_val_acc:.4f}"
@@ -545,7 +550,11 @@ def train(args):
 
         state = reset_optimizer(
             state,
-            create_decoder_only_optimizer(state.params, getattr(args, "hw_calibrate_lr", 1e-4)),
+            create_hw_calibration_optimizer(
+                state.params,
+                getattr(args, "hw_calibrate_lr", 1e-4),
+                hw_calibrate_mode,
+            ),
         )
 
         best_calibrated_params = state.params
@@ -566,6 +575,24 @@ def train(args):
                 in_dim,
                 args.batchnorm,
             )
+
+            if hw_calibrate_mode == "analog" and hw_project_each_epoch:
+                projected_params, projection_report = project_params_tree(
+                    params=state.params,
+                    ssm_param=args.ssm_param,
+                    sample_rate=getattr(args, "hw_sample_rate", 16000.0),
+                    projection_config=projection_config,
+                )
+                state = state.replace(params=projected_params)
+                aggregate = projection_report.get("aggregate", {})
+                print(
+                    "[*] HW analog epoch projection clip fraction: {:.6f} (low={}, high={}, total={})".format(
+                        aggregate.get("clip_fraction", 0.0),
+                        aggregate.get("num_clipped_low", 0),
+                        aggregate.get("num_clipped_high", 0),
+                        aggregate.get("num_conductances", 0),
+                    )
+                )
 
             if valloader is not None:
                 print(f"[*] Running HW Calibration Epoch {cal_epoch + 1} Validation...")

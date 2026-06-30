@@ -99,6 +99,10 @@ if __name__ == "__main__":
 						help="Number of extra decoder-only hardware calibration epochs.")
 	parser.add_argument("--hw_calibrate_lr", type=float, default=1e-4,
 						help="Fixed decoder/readout learning rate during hardware calibration.")
+	parser.add_argument("--hw_calibrate_mode", type=str, default="readout", choices=["readout", "analog"],
+						help="Hardware calibration mode: readout trains only decoder; analog trains encoder, SSM, and decoder with projection between epochs.")
+	parser.add_argument("--hw_project_each_calibration_epoch", type=str2bool, default=True,
+						help="Project params back to the hardware-feasible set after each analog calibration epoch.")
 	parser.add_argument("--hw_sample_rate", type=float, default=16000.0,
 						help="Sample rate used to convert trained SSM params to hardware coefficients.")
 	parser.add_argument("--hw_g_min", type=float, default=1e-6,
