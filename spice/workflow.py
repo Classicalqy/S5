@@ -6,7 +6,6 @@ import argparse
 import csv
 import json
 import shutil
-from itertools import product
 from pathlib import Path
 
 import numpy as np
@@ -61,12 +60,12 @@ def _parse_sweep_values(values, cast):
     return parsed
 
 
-def _case_name(quant_bits, variation_sigma):
+def _case_name(variation_sigma):
     sigma = "{:.6g}".format(float(variation_sigma)).replace("-", "m").replace(".", "p")
-    return f"q{int(quant_bits)}_v{sigma}"
+    return f"v{sigma}"
 
 
-def _projection_config(quant_bits, variation_sigma, g_min, g_max, c_min, c_max, variation_seed):
+def _projection_config(variation_sigma, g_min, g_max, c_min, c_max, variation_seed):
     return HardwareProjectionConfig(
         hardware_projection="conductance",
         projection_scope="block",
@@ -74,8 +73,6 @@ def _projection_config(quant_bits, variation_sigma, g_min, g_max, c_min, c_max, 
         g_max=g_max,
         c_min=c_min,
         c_max=c_max,
-        quant_bits=int(quant_bits),
-        quant_mode="linear",
         variation_sigma=float(variation_sigma),
         variation_seed=int(variation_seed),
     )
@@ -733,7 +730,6 @@ def run_workflow(
     samples=None,
     labels=None,
     hardware_projection=False,
-    quant_bits=(0,),
     variation_sigma=(0.0,),
     variation_seed=0,
     g_min=1e-6,
@@ -741,7 +737,6 @@ def run_workflow(
     c_min=1e-12,
     c_max=1e-6,
 ):
-    quant_bits = tuple(quant_bits) if quant_bits else (0,)
     variation_sigma = tuple(variation_sigma) if variation_sigma else (0.0,)
     out_dir = Path(out_dir)
     netlist_dir = out_dir / "netlist"
@@ -835,10 +830,10 @@ def run_workflow(
 
     projection_runs = []
     if hardware_projection:
-        for bits, sigma in product(quant_bits, variation_sigma):
-            case = _case_name(bits, sigma)
+        for sigma in variation_sigma:
+            case = _case_name(sigma)
             case_netlist_dir = netlist_dir / case
-            config = _projection_config(bits, sigma, g_min, g_max, c_min, c_max, variation_seed)
+            config = _projection_config(sigma, g_min, g_max, c_min, c_max, variation_seed)
             projected_params, projection_report = save_projected_params(
                 params_path,
                 ssm_param,
@@ -911,7 +906,6 @@ def run_workflow(
             projection_runs.append(
                 {
                     "case": case,
-                    "quant_bits": int(bits),
                     "variation_sigma": float(sigma),
                     "netlists": projected_netlists,
                     "projection": projection_report,
@@ -960,7 +954,6 @@ def parse_args(argv=None):
     parser.add_argument("--layer-stimulus", choices=["sine", "step", "impulse"], default="sine")
     parser.add_argument("--layer-amplitude", type=float, default=0.1)
     parser.add_argument("--hardware-projection", "--hardware_projection", default=False)
-    parser.add_argument("--quant-bits", "--quant_bits", nargs="*", default=["0"])
     parser.add_argument("--variation-sigma", "--variation_sigma", nargs="*", default=["0.0"])
     parser.add_argument("--variation-seed", "--variation_seed", type=int, default=0)
     parser.add_argument("--g-min", "--g_min", type=float, default=1e-6)
@@ -991,7 +984,6 @@ def main(argv=None):
         layer_stimulus=args.layer_stimulus,
         layer_amplitude=args.layer_amplitude,
         hardware_projection=_as_bool(args.hardware_projection),
-        quant_bits=_parse_sweep_values(args.quant_bits, int),
         variation_sigma=_parse_sweep_values(args.variation_sigma, float),
         variation_seed=args.variation_seed,
         g_min=args.g_min,

@@ -55,8 +55,8 @@ def _hw_projection_config(args):
         g_max=getattr(args, "hw_g_max", 150e-6),
         c_min=getattr(args, "hw_c_min", 1e-12),
         c_max=getattr(args, "hw_c_max", 1e-6),
-        quant_bits=int(getattr(args, "hw_quant_bits", 0)),
-        quant_mode=getattr(args, "hw_quant_mode", "linear"),
+        variation_sigma=getattr(args, "hw_variation_sigma", 0.0),
+        variation_seed=getattr(args, "hw_variation_seed", 0),
     )
 
 

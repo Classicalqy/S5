@@ -174,7 +174,7 @@ analog transient error and the expected model-semantics difference.
 ## Hardware Projection Workflow
 
 Use `spice.workflow` with `--hardware-projection True` to sweep conductance
-projection, quantization, and variation:
+projection and variation:
 
 ```bash
 python -m spice.workflow \
@@ -183,7 +183,6 @@ python -m spice.workflow \
   --sample-rate 16000 \
   --out-dir out/spice_energy_shaped_5 \
   --hardware-projection True \
-  --quant-bits 2 4 8 \
   --variation-sigma 0.01 0.05 \
   --full-samples 5 \
   --accuracy-samples 5

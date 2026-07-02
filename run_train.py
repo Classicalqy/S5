@@ -113,10 +113,10 @@ if __name__ == "__main__":
 						help="Minimum capacitance for hardware projection.")
 	parser.add_argument("--hw_c_max", type=float, default=1e-6,
 						help="Maximum capacitance for hardware projection.")
-	parser.add_argument("--hw_quant_bits", type=int, default=0,
-						help="Conductance quantization bits during hardware projection; 0 disables quantization.")
-	parser.add_argument("--hw_quant_mode", type=str, default="linear", choices=["none", "linear", "log"],
-						help="Conductance quantization grid used when --hw_quant_bits is positive.")
+	parser.add_argument("--hw_variation_sigma", type=float, default=0.0,
+						help="Multiplicative conductance variation sigma during hardware projection.")
+	parser.add_argument("--hw_variation_seed", type=int, default=0,
+						help="Random seed for conductance variation during hardware projection.")
 	parser.add_argument("--hw_calibrated_params_out", type=str, default=None,
 						help="Path for best hardware-calibrated params; defaults beside --params_out.")
 

@@ -665,8 +665,6 @@ def add_projection_args(parser):
     parser.add_argument("--g-max", "--g_max", type=float, default=150e-6)
     parser.add_argument("--c-min", "--c_min", type=float, default=1e-12)
     parser.add_argument("--c-max", "--c_max", type=float, default=1e-6)
-    parser.add_argument("--quant-bits", "--quant_bits", type=int, default=0)
-    parser.add_argument("--quant-mode", "--quant_mode", default="none", choices=sorted({"none", "linear", "log"}))
     parser.add_argument("--variation-sigma", "--variation_sigma", type=float, default=0.0)
     parser.add_argument("--variation-seed", "--variation_seed", type=int, default=0)
     parser.add_argument("--projection-report", "--projection_report", default=None)
@@ -681,8 +679,6 @@ def projection_config_from_args(args):
         g_max=args.g_max,
         c_min=args.c_min,
         c_max=args.c_max,
-        quant_bits=args.quant_bits,
-        quant_mode=args.quant_mode,
         variation_sigma=args.variation_sigma,
         variation_seed=args.variation_seed,
     )
