@@ -30,7 +30,6 @@ from spice.hardware_projection import (
     HardwareProjectionConfig,
     project_layers,
     project_signed_weights_to_conductance,
-    quantize_conductance,
 )
 from spice.projected_params import save_projected_params as compat_save_projected_params
 from spice.metrics import trace_metrics
@@ -267,22 +266,12 @@ def test_hardware_projection_wide_ranges_preserve_coefficients():
             g_max=1e12,
             c_min=1e-12,
             c_max=1e12,
-            quant_bits=0,
         ),
     )
 
     np.testing.assert_allclose(projected_layers[0].A_tr, layer.A_tr, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(projected_layers[0].B_tr, layer.B_tr, rtol=1e-12, atol=1e-12)
     assert report["aggregate"]["clip_fraction"] == 0.0
-
-
-def test_quant_bits_reduce_distinct_conductance_levels():
-    conductances = np.linspace(1e-6, 1e-4, 64)
-
-    high = quantize_conductance(conductances, 1e-6, 1e-4, bits=6, mode="linear")
-    low = quantize_conductance(conductances, 1e-6, 1e-4, bits=2, mode="linear")
-
-    assert np.unique(low).size < np.unique(high).size
 
 
 def test_hardware_projection_variation_seed_reproducibility():
@@ -324,7 +313,6 @@ def test_hardware_projection_state_rescale_updates_output_weights():
             g_max=1e-4,
             c_min=1e-12,
             c_max=1e-6,
-            quant_bits=0,
         ),
     )
 
@@ -341,7 +329,6 @@ def test_hardware_projection_low_clip_maps_to_zero():
         c=1e-6,
         g_min=1e-6,
         g_max=1e-4,
-        quant_bits=0,
     )
 
     assert projected[0] == 0.0
@@ -375,7 +362,6 @@ def test_hardware_projector_projects_params_tree_and_default_path():
             g_max=1e-4,
             c_min=1e-9,
             c_max=1e-6,
-            quant_bits=0,
         ),
     )
 
@@ -402,7 +388,6 @@ def test_hardware_projector_projects_exported_dense_params():
             g_max=150e-6,
             c_min=1e-9,
             c_max=1e-6,
-            quant_bits=0,
         ),
     )
 
@@ -441,7 +426,6 @@ def test_projected_params_compat_save_projected_params_still_resolves(tmp_path):
             g_max=1e-4,
             c_min=1e-9,
             c_max=1e-6,
-            quant_bits=0,
         ),
         out_path,
     )
@@ -464,8 +448,6 @@ def test_projected_manifest_records_stats_and_capacitances():
             g_max=1e-4,
             c_min=1e-9,
             c_max=1e-6,
-            quant_bits=2,
-            quant_mode="linear",
         ),
     )
 
@@ -674,7 +656,6 @@ def test_full_model_projection_clips_encoder_decoder_conductances_and_biases():
             g_max=150e-6,
             c_min=1e-9,
             c_max=1e-6,
-            quant_bits=0,
         ),
     )
 
@@ -991,7 +972,6 @@ def test_workflow_hardware_projection_sweep_writes_outputs(tmp_path):
         sample_rate=10.0,
         out_dir=tmp_path / "hardware",
         hardware_projection=True,
-        quant_bits=[2],
         variation_sigma=[0.0],
         g_min=1e-6,
         g_max=1e-4,
@@ -1004,7 +984,7 @@ def test_workflow_hardware_projection_sweep_writes_outputs(tmp_path):
         accuracy_samples=2,
     )
 
-    case_dir = tmp_path / "hardware" / "netlist" / "q2_v0"
+    case_dir = tmp_path / "hardware" / "netlist" / "v0"
     assert (case_dir / "params.msgpack").exists()
     assert (case_dir / "ssm_layers.cir").exists()
     assert (case_dir / "full_model.cir").exists()
@@ -1018,8 +998,8 @@ def test_workflow_hardware_projection_sweep_writes_outputs(tmp_path):
         for key in ("B", "C", "raw_alpha", "log_step", "omega"):
             if key in original:
                 assert np.asarray(mapped[key]).shape == np.asarray(original[key]).shape
-    assert (tmp_path / "hardware" / "layer_sanity" / "q2_v0" / "summary.json").exists()
-    assert (tmp_path / "hardware" / "full_alignment" / "q2_v0" / "summary.json").exists()
-    assert (tmp_path / "hardware" / "accuracy" / "q2_v0" / "summary.json").exists()
-    assert summary["projection_runs"][0]["case"] == "q2_v0"
+    assert (tmp_path / "hardware" / "layer_sanity" / "v0" / "summary.json").exists()
+    assert (tmp_path / "hardware" / "full_alignment" / "v0" / "summary.json").exists()
+    assert (tmp_path / "hardware" / "accuracy" / "v0" / "summary.json").exists()
+    assert summary["projection_runs"][0]["case"] == "v0"
     assert summary["projection_runs"][0]["accuracy"]["source"] == "full_alignment"

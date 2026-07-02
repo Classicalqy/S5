@@ -1,6 +1,6 @@
 """Digital-only hardware variation sweep.
 
-This evaluates checkpoints after conductance projection and static conductance
+This evaluates checkpoints after conductance projection and static component
 variation, without running LTSpice. For each variation setting it writes:
 
 * projected params: ``<out-dir>/<case>/params.msgpack``

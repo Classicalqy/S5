@@ -42,10 +42,17 @@ def save_params_msgpack(params, out_path):
 
 
 def _hw_calibration_enabled(args):
-    return bool(getattr(args, "hw_calibrate_readout", False)) and int(getattr(args, "hw_calibrate_epochs", 0)) > 0
+    return bool(getattr(args, "hw_calibrate_readout", False)) and (
+        int(getattr(args, "hw_calibrate_epochs", 0)) > 0
+        or int(getattr(args, "hw_variation_aware_epochs", 0)) > 0
+    )
 
 
-def _hw_projection_config(args):
+def _hw_variation_aware_enabled(args):
+    return int(getattr(args, "hw_variation_aware_epochs", 0)) > 0
+
+
+def _hw_projection_config(args, variation_sigma=None, variation_seed=None):
     from spice.hardware_projection import HardwareProjectionConfig
 
     return HardwareProjectionConfig(
@@ -55,8 +62,8 @@ def _hw_projection_config(args):
         g_max=getattr(args, "hw_g_max", 150e-6),
         c_min=getattr(args, "hw_c_min", 1e-12),
         c_max=getattr(args, "hw_c_max", 1e-6),
-        variation_sigma=getattr(args, "hw_variation_sigma", 0.0),
-        variation_seed=getattr(args, "hw_variation_seed", 0),
+        variation_sigma=getattr(args, "hw_variation_sigma", 0.0) if variation_sigma is None else variation_sigma,
+        variation_seed=getattr(args, "hw_variation_seed", 0) if variation_seed is None else variation_seed,
     )
 
 
@@ -68,6 +75,14 @@ def _hw_calibrated_params_out(args):
     from spice.hardware_projector import default_projected_params_path
 
     return default_projected_params_path(args.params_out)
+
+
+def _hw_variation_aware_params_out(args):
+    path = getattr(args, "hw_variation_aware_params_out", None)
+    if path:
+        return Path(path)
+    path = Path(args.params_out)
+    return path.with_name(f"{path.stem}_variation_aware{path.suffix or '.msgpack'}")
 
 
 def train(args):
@@ -465,6 +480,10 @@ def train(args):
         if count > args.early_stop_patience:
             break
 
+    if getattr(args, "save_params", False) or _hw_calibration_enabled(args):
+        out_path = save_params_msgpack(best_params, args.params_out)
+        print("[*] Saved best normal-training params to {}".format(out_path))
+
     if _hw_calibration_enabled(args):
         if not is_hardware_friendly(args.ssm_param):
             raise ValueError("--hw_calibrate_readout requires a hardware-friendly ssm_param.")
@@ -652,23 +671,165 @@ def train(args):
                 }
             )
 
+        calibrated_out = save_params_msgpack(best_calibrated_params, _hw_calibrated_params_out(args))
+        print("[*] Saved best nominal hardware-calibrated params to {}".format(calibrated_out))
+        wandb.run.summary["HW Calibration Params Out"] = str(calibrated_out)
+
+        if _hw_variation_aware_enabled(args):
+            aware_sigma = float(getattr(args, "hw_variation_aware_sigma", 0.0))
+            aware_seed = int(getattr(args, "hw_variation_aware_seed", 0))
+            nominal_config = _hw_projection_config(args, variation_sigma=0.0)
+            print(f"[*] Starting variation-aware analog calibration with sigma={aware_sigma:.6g}...")
+
+            nominal_params, projection_report = project_params_tree(
+                params=best_calibrated_params,
+                ssm_param=args.ssm_param,
+                sample_rate=getattr(args, "hw_sample_rate", 16000.0),
+                projection_config=nominal_config,
+            )
+            state = state.replace(params=nominal_params)
+            state = reset_optimizer(
+                state,
+                create_hw_calibration_optimizer(
+                    state.params,
+                    getattr(args, "hw_calibrate_lr", 1e-4),
+                    "analog",
+                ),
+            )
+
+            best_aware_params = state.params
+            best_aware_batch_stats = state.batch_stats if args.batchnorm and hasattr(state, "batch_stats") else None
+            best_aware_loss, best_aware_acc = 100000000, -100000000.0
+            best_aware_test_loss, best_aware_test_acc = 100000000, -100000000.0
+            best_aware_epoch = 0
+
+            for aware_epoch in range(int(args.hw_variation_aware_epochs)):
+                variation_seed = aware_seed + aware_epoch
+                varied_config = _hw_projection_config(
+                    args,
+                    variation_sigma=aware_sigma,
+                    variation_seed=variation_seed,
+                )
+                varied_params, projection_report = project_params_tree(
+                    params=state.params,
+                    ssm_param=args.ssm_param,
+                    sample_rate=getattr(args, "hw_sample_rate", 16000.0),
+                    projection_config=varied_config,
+                )
+                state = state.replace(params=varied_params)
+
+                print(f"[*] Starting HW Variation-Aware Epoch {aware_epoch + 1} (seed={variation_seed})...")
+                train_rng, skey = random.split(train_rng)
+                state, aware_train_loss = calibration_epoch(
+                    state,
+                    skey,
+                    model_cls,
+                    trainloader,
+                    seq_len,
+                    in_dim,
+                    args.batchnorm,
+                )
+
+                nominal_params, projection_report = project_params_tree(
+                    params=state.params,
+                    ssm_param=args.ssm_param,
+                    sample_rate=getattr(args, "hw_sample_rate", 16000.0),
+                    projection_config=nominal_config,
+                )
+                state = state.replace(params=nominal_params)
+
+                eval_params, projection_report = project_params_tree(
+                    params=state.params,
+                    ssm_param=args.ssm_param,
+                    sample_rate=getattr(args, "hw_sample_rate", 16000.0),
+                    projection_config=varied_config,
+                )
+                eval_state = state.replace(params=eval_params)
+                if valloader is not None:
+                    print(f"[*] Running HW Variation-Aware Epoch {aware_epoch + 1} Validation...")
+                    aware_val_loss, aware_val_acc = validate(
+                        eval_state,
+                        model_cls,
+                        valloader,
+                        seq_len,
+                        in_dim,
+                        args.batchnorm,
+                    )
+                    print(f"[*] Running HW Variation-Aware Epoch {aware_epoch + 1} Test...")
+                    aware_test_loss, aware_test_acc = validate(
+                        eval_state,
+                        model_cls,
+                        testloader,
+                        seq_len,
+                        in_dim,
+                        args.batchnorm,
+                    )
+                else:
+                    print(f"[*] Running HW Variation-Aware Epoch {aware_epoch + 1} Test...")
+                    aware_val_loss, aware_val_acc = validate(
+                        eval_state,
+                        model_cls,
+                        testloader,
+                        seq_len,
+                        in_dim,
+                        args.batchnorm,
+                    )
+                    aware_test_loss, aware_test_acc = aware_val_loss, aware_val_acc
+
+                aggregate = projection_report.get("aggregate", {})
+                print(f"\n=>> HW Variation-Aware Epoch {aware_epoch + 1} Metrics ===")
+                print(
+                    f"\tTrain Loss: {aware_train_loss:.5f} -- Var Val Loss: {aware_val_loss:.5f} --"
+                    f" Var Test Loss: {aware_test_loss:.5f} -- Var Val Accuracy: {aware_val_acc:.4f}"
+                    f" Var Test Accuracy: {aware_test_acc:.4f}"
+                )
+
+                if aware_val_acc > best_aware_acc:
+                    best_aware_loss = aware_val_loss
+                    best_aware_acc = aware_val_acc
+                    best_aware_test_loss = aware_test_loss
+                    best_aware_test_acc = aware_test_acc
+                    best_aware_epoch = aware_epoch
+                    best_aware_params = state.params
+                    if args.batchnorm and hasattr(state, "batch_stats"):
+                        best_aware_batch_stats = state.batch_stats
+
+                wandb.log(
+                    {
+                        "HW Variation-Aware Training Loss": aware_train_loss,
+                        "HW Variation-Aware Val loss": aware_val_loss,
+                        "HW Variation-Aware Val Accuracy": aware_val_acc,
+                        "HW Variation-Aware Test Loss": aware_test_loss,
+                        "HW Variation-Aware Test Accuracy": aware_test_acc,
+                    }
+                )
+
+            best_calibrated_params = best_aware_params
+            best_calibrated_batch_stats = best_aware_batch_stats
+            best_calibrated_loss = best_aware_loss
+            best_calibrated_acc = best_aware_acc
+            best_calibrated_test_loss = best_aware_test_loss
+            best_calibrated_test_acc = best_aware_test_acc
+            best_calibrated_epoch = best_aware_epoch
+            wandb.run.summary["HW Variation-Aware Best Val Loss"] = best_aware_loss
+            wandb.run.summary["HW Variation-Aware Best Val Accuracy"] = best_aware_acc
+            wandb.run.summary["HW Variation-Aware Best Epoch"] = best_aware_epoch
+            wandb.run.summary["HW Variation-Aware Best Test Loss"] = best_aware_test_loss
+            wandb.run.summary["HW Variation-Aware Best Test Accuracy"] = best_aware_test_acc
+            aware_out = save_params_msgpack(best_aware_params, _hw_variation_aware_params_out(args))
+            print("[*] Saved best variation-aware hardware-calibrated params to {}".format(aware_out))
+            wandb.run.summary["HW Variation-Aware Params Out"] = str(aware_out)
+
         state = state.replace(params=best_calibrated_params)
         if args.batchnorm and best_calibrated_batch_stats is not None and hasattr(state, "batch_stats"):
             state = state.replace(batch_stats=best_calibrated_batch_stats)
 
-        calibrated_out = save_params_msgpack(best_calibrated_params, _hw_calibrated_params_out(args))
-        print("[*] Saved best hardware-calibrated params to {}".format(calibrated_out))
         wandb.run.summary["HW Calibration Best Val Loss"] = best_calibrated_loss
         wandb.run.summary["HW Calibration Best Val Accuracy"] = best_calibrated_acc
         wandb.run.summary["HW Calibration Best Epoch"] = best_calibrated_epoch
         wandb.run.summary["HW Calibration Best Test Loss"] = best_calibrated_test_loss
         wandb.run.summary["HW Calibration Best Test Accuracy"] = best_calibrated_test_acc
-        wandb.run.summary["HW Calibration Params Out"] = str(calibrated_out)
         wandb.run.summary["HW Projection Clip Fraction"] = aggregate.get("clip_fraction", 0.0)
 
     if getattr(args, "plot_ssm_diagnostics", False):
         plot_ssm_diagnostics(state.params, args)
-
-    if getattr(args, "save_params", False):
-        out_path = save_params_msgpack(best_params, args.params_out)
-        print("[*] Saved best params to {}".format(out_path))

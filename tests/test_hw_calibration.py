@@ -1,7 +1,7 @@
 import jax.numpy as np
 import pytest
 
-from s5.train import _hw_calibration_enabled, _hw_calibrated_params_out
+from s5.train import _hw_calibration_enabled, _hw_calibrated_params_out, _hw_variation_aware_params_out
 from s5.train_helpers import (
     analog_calibration_param_labels,
     create_hw_calibration_optimizer,
@@ -82,12 +82,17 @@ def test_hw_calibration_gate_requires_flag_and_epochs():
     args = Args()
     args.hw_calibrate_readout = False
     args.hw_calibrate_epochs = 10
+    args.hw_variation_aware_epochs = 0
     assert not _hw_calibration_enabled(args)
 
     args.hw_calibrate_readout = True
     args.hw_calibrate_epochs = 0
     assert not _hw_calibration_enabled(args)
 
+    args.hw_variation_aware_epochs = 1
+    assert _hw_calibration_enabled(args)
+
+    args.hw_variation_aware_epochs = 0
     args.hw_calibrate_epochs = 1
     assert _hw_calibration_enabled(args)
 
@@ -100,3 +105,13 @@ def test_hw_calibrated_params_out_defaults_to_projected_path():
 
     args.hw_calibrated_params_out = "./checkpoints/calibrated.msgpack"
     assert str(_hw_calibrated_params_out(args)).endswith("calibrated.msgpack")
+
+
+def test_hw_variation_aware_params_out_defaults_beside_params_out():
+    args = Args()
+    args.params_out = "./checkpoints/model_params.msgpack"
+    args.hw_variation_aware_params_out = None
+    assert str(_hw_variation_aware_params_out(args)).endswith("model_params_variation_aware.msgpack")
+
+    args.hw_variation_aware_params_out = "./checkpoints/aware.msgpack"
+    assert str(_hw_variation_aware_params_out(args)).endswith("aware.msgpack")

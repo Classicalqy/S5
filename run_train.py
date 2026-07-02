@@ -114,11 +114,19 @@ if __name__ == "__main__":
 	parser.add_argument("--hw_c_max", type=float, default=1e-6,
 						help="Maximum capacitance for hardware projection.")
 	parser.add_argument("--hw_variation_sigma", type=float, default=0.0,
-						help="Multiplicative conductance variation sigma during hardware projection.")
+						help="Multiplicative component variation sigma during hardware projection.")
 	parser.add_argument("--hw_variation_seed", type=int, default=0,
-						help="Random seed for conductance variation during hardware projection.")
+						help="Random seed for component variation during hardware projection.")
+	parser.add_argument("--hw_variation_aware_epochs", type=int, default=0,
+						help="Extra analog calibration epochs with random component variation.")
+	parser.add_argument("--hw_variation_aware_sigma", type=float, default=0.0,
+						help="Component variation sigma used by variation-aware analog calibration.")
+	parser.add_argument("--hw_variation_aware_seed", type=int, default=0,
+						help="Base random seed for variation-aware analog calibration.")
 	parser.add_argument("--hw_calibrated_params_out", type=str, default=None,
 						help="Path for best hardware-calibrated params; defaults beside --params_out.")
+	parser.add_argument("--hw_variation_aware_params_out", type=str, default=None,
+						help="Path for best variation-aware hardware-calibrated params; defaults beside --params_out.")
 
 	# Optimization Parameters
 	parser.add_argument("--prenorm", type=str2bool, default=True,

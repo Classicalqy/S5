@@ -59,11 +59,11 @@ def choose_capacitance(weights, g_min, g_max, c_min, c_max):
     return _optimized_capacitance(nonzero, g_min, g_max, c_min, c_max)
 
 
-def add_conductance_variation(g, sigma, rng):
-    g = np.asarray(g, dtype=np.float64)
-    if float(sigma) <= 0.0 or g.size == 0:
-        return g.copy()
-    varied = g * (1.0 + rng.normal(0.0, float(sigma), size=g.shape))
+def add_component_variation(values, sigma, rng):
+    values = np.asarray(values, dtype=np.float64)
+    if float(sigma) <= 0.0 or values.size == 0:
+        return values.copy()
+    varied = values * (1.0 + rng.normal(0.0, float(sigma), size=values.shape))
     return np.maximum(varied, np.finfo(np.float64).tiny)
 
 
@@ -80,12 +80,13 @@ def project_signed_weights_to_conductance(weights, c, g_min, g_max, variation_si
     g_clipped = np.where(low, 0.0, np.minimum(g_before, float(g_max)))
     if rng is None:
         rng = np.random.default_rng(0)
+    c_after = float(add_component_variation(np.asarray([float(c)]), variation_sigma, rng)[0])
     g_after = g_clipped.copy()
     nonzero_g = g_after > 0.0
-    g_after[nonzero_g] = add_conductance_variation(g_after[nonzero_g], variation_sigma, rng)
-    projected[mask] = np.sign(weights[mask]) * g_after / float(c)
+    g_after[nonzero_g] = add_component_variation(g_after[nonzero_g], variation_sigma, rng)
+    projected[mask] = np.sign(weights[mask]) * g_after / c_after
     stats = _group_stats(
-        c,
+        c_after,
         g_before,
         g_after,
         g_clipped,
@@ -112,7 +113,7 @@ def project_dense_weights_to_conductance(weights, config, feedback_resistance, r
         rng = np.random.default_rng(0)
     g_after = g_clipped.copy()
     nonzero_g = g_after > 0.0
-    g_after[nonzero_g] = add_conductance_variation(g_after[nonzero_g], config.variation_sigma, rng)
+    g_after[nonzero_g] = add_component_variation(g_after[nonzero_g], config.variation_sigma, rng)
     projected[mask] = np.sign(weights[mask]) * g_after * float(feedback_resistance)
     stats = _dense_group_stats(
         feedback_resistance,
@@ -247,8 +248,9 @@ def project_layers(layers, config):
         )
         for entry, value in projected_items:
             _write_entry(projected_layers, entry, value)
+        projected_c = stats["capacitance"]
         for entry in entries:
-            _write_capacitance(projected_layers, entry, c)
+            _write_capacitance(projected_layers, entry, projected_c)
         stats.update(_group_identity(entries))
         group_stats.append(stats)
 
@@ -415,6 +417,7 @@ def _project_items_to_conductance(layers, items, c, config, rng):
     g_clipped_values = []
     clipped_low = 0
     clipped_high = 0
+    c_after = float(add_component_variation(np.asarray([float(c)]), config.variation_sigma, rng)[0])
     for item in items:
         values = np.asarray([_read_entry(layers, entry) for entry in item], dtype=np.float64)
         mask = values != 0.0
@@ -429,19 +432,19 @@ def _project_items_to_conductance(layers, items, c, config, rng):
             g_after = 0.0
         else:
             g_clipped = float(min(g_before, config.g_max))
-            g_after = float(add_conductance_variation(np.asarray([g_clipped]), config.variation_sigma, rng)[0])
+            g_after = float(add_component_variation(np.asarray([g_clipped]), config.variation_sigma, rng)[0])
         for entry, value in zip(item, values):
             if value == 0.0:
                 projected_items.append((entry, 0.0))
                 continue
-            projected_items.append((entry, float(np.sign(value) * g_after / float(c))))
+            projected_items.append((entry, float(np.sign(value) * g_after / c_after)))
             g_before_values.append(g_before)
             g_clipped_values.append(g_clipped)
             g_after_values.append(g_after)
             clipped_low += int(g_before < config.g_min)
             clipped_high += int(g_before > config.g_max)
     stats = _group_stats(
-        c,
+        c_after,
         np.asarray(g_before_values, dtype=np.float64),
         np.asarray(g_after_values, dtype=np.float64),
         np.asarray(g_clipped_values, dtype=np.float64),
