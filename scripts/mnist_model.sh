@@ -10,8 +10,8 @@ set -euo pipefail
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate s5
 
+p=resonant_2x2
 for seed in 0 1 2 3 4; do
-  p=resonant_2x2
   base=checkpoints/mnist_${p}_seed${seed}_params
   echo "Running ssm_param=$p seed=$seed"
 
@@ -43,7 +43,33 @@ for seed in 0 1 2 3 4; do
     hw_variation_aware_epochs=5 \
     hw_variation_aware_sigma=0.01 \
     hw_variation_aware_seed=$seed \
+    hw_variation_aware_train_samples=3 \
+    hw_variation_aware_eval_samples=3 \
     params_out=${base}.msgpack \
     hw_calibrated_params_out=${base}_calibrated.msgpack \
     hw_variation_aware_params_out=${base}_variation_aware.msgpack
 done
+
+echo "Running MNIST variation sweep"
+python -m spice.digital_variation_test \
+  --params "checkpoints/mnist_${p}_seed*_params_calibrated.msgpack" \
+           "checkpoints/mnist_${p}_seed*_params_variation_aware.msgpack" \
+  --out-dir out/mnist_variation_sweep \
+  --dataset mnist-classification \
+  --ssm-param "$p" \
+  --sample-rate 160000 \
+  --n-layers 2 \
+  --d-model 16 \
+  --ssm-size-base 64 \
+  --blocks 1 \
+  --mode last \
+  --use-residual False \
+  --batchnorm False \
+  --activation-fn relu \
+  --layernorm False \
+  --p-dropout 0.0 \
+  --bsz 64 \
+  --c-min 1e-12 \
+  --c-max 1e-9 \
+  --variation-sigma 0 0.005 0.01 0.02 \
+  --variation-seed 0 1 2 3 4

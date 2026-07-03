@@ -85,6 +85,28 @@ def _hw_variation_aware_params_out(args):
     return path.with_name(f"{path.stem}_variation_aware{path.suffix or '.msgpack'}")
 
 
+def _hw_variation_aware_train_samples(args):
+    return max(1, int(getattr(args, "hw_variation_aware_train_samples", 3)))
+
+
+def _hw_variation_aware_eval_samples(args):
+    return max(1, int(getattr(args, "hw_variation_aware_eval_samples", 3)))
+
+
+def _hw_variation_aware_train_seed(base_seed, epoch, sample_index, train_samples):
+    return int(base_seed) + int(epoch) * int(train_samples) + int(sample_index)
+
+
+def _hw_variation_aware_eval_seed(base_seed, epoch, sample_index, eval_samples):
+    return int(base_seed) + 10000 + int(epoch) * int(eval_samples) + int(sample_index)
+
+
+def _hw_variation_aware_score(val_accuracies, select_metric):
+    if select_metric != "mean_acc":
+        raise ValueError(f"Unknown variation-aware selection metric: {select_metric}")
+    return float(np.mean(np.asarray(val_accuracies, dtype=np.float32)))
+
+
 def train(args):
     """
     Main function to train over a certain number of epochs
@@ -678,8 +700,18 @@ def train(args):
         if _hw_variation_aware_enabled(args):
             aware_sigma = float(getattr(args, "hw_variation_aware_sigma", 0.0))
             aware_seed = int(getattr(args, "hw_variation_aware_seed", 0))
+            aware_train_samples = _hw_variation_aware_train_samples(args)
+            aware_eval_samples = _hw_variation_aware_eval_samples(args)
+            aware_select_metric = getattr(args, "hw_variation_aware_select_metric", "mean_acc")
             nominal_config = _hw_projection_config(args, variation_sigma=0.0)
-            print(f"[*] Starting variation-aware analog calibration with sigma={aware_sigma:.6g}...")
+            print(
+                "[*] Starting variation-aware analog calibration with sigma={:.6g}, "
+                "train_samples={}, eval_samples={}...".format(
+                    aware_sigma,
+                    aware_train_samples,
+                    aware_eval_samples,
+                )
+            )
 
             nominal_params, projection_report = project_params_tree(
                 params=best_calibrated_params,
@@ -704,84 +736,141 @@ def train(args):
             best_aware_epoch = 0
 
             for aware_epoch in range(int(args.hw_variation_aware_epochs)):
-                variation_seed = aware_seed + aware_epoch
-                varied_config = _hw_projection_config(
-                    args,
-                    variation_sigma=aware_sigma,
-                    variation_seed=variation_seed,
-                )
-                varied_params, projection_report = project_params_tree(
-                    params=state.params,
-                    ssm_param=args.ssm_param,
-                    sample_rate=getattr(args, "hw_sample_rate", 16000.0),
-                    projection_config=varied_config,
-                )
-                state = state.replace(params=varied_params)
+                train_losses = []
+                for sample_index in range(aware_train_samples):
+                    variation_seed = _hw_variation_aware_train_seed(
+                        aware_seed,
+                        aware_epoch,
+                        sample_index,
+                        aware_train_samples,
+                    )
+                    varied_config = _hw_projection_config(
+                        args,
+                        variation_sigma=aware_sigma,
+                        variation_seed=variation_seed,
+                    )
+                    varied_params, projection_report = project_params_tree(
+                        params=state.params,
+                        ssm_param=args.ssm_param,
+                        sample_rate=getattr(args, "hw_sample_rate", 16000.0),
+                        projection_config=varied_config,
+                    )
+                    state = state.replace(params=varied_params)
 
-                print(f"[*] Starting HW Variation-Aware Epoch {aware_epoch + 1} (seed={variation_seed})...")
-                train_rng, skey = random.split(train_rng)
-                state, aware_train_loss = calibration_epoch(
-                    state,
-                    skey,
-                    model_cls,
-                    trainloader,
-                    seq_len,
-                    in_dim,
-                    args.batchnorm,
-                )
-
-                nominal_params, projection_report = project_params_tree(
-                    params=state.params,
-                    ssm_param=args.ssm_param,
-                    sample_rate=getattr(args, "hw_sample_rate", 16000.0),
-                    projection_config=nominal_config,
-                )
-                state = state.replace(params=nominal_params)
-
-                eval_params, projection_report = project_params_tree(
-                    params=state.params,
-                    ssm_param=args.ssm_param,
-                    sample_rate=getattr(args, "hw_sample_rate", 16000.0),
-                    projection_config=varied_config,
-                )
-                eval_state = state.replace(params=eval_params)
-                if valloader is not None:
-                    print(f"[*] Running HW Variation-Aware Epoch {aware_epoch + 1} Validation...")
-                    aware_val_loss, aware_val_acc = validate(
-                        eval_state,
+                    print(
+                        "[*] Starting HW Variation-Aware Epoch {} Sample {} (seed={})...".format(
+                            aware_epoch + 1,
+                            sample_index + 1,
+                            variation_seed,
+                        )
+                    )
+                    train_rng, skey = random.split(train_rng)
+                    state, sample_train_loss = calibration_epoch(
+                        state,
+                        skey,
                         model_cls,
-                        valloader,
+                        trainloader,
                         seq_len,
                         in_dim,
                         args.batchnorm,
                     )
-                    print(f"[*] Running HW Variation-Aware Epoch {aware_epoch + 1} Test...")
-                    aware_test_loss, aware_test_acc = validate(
-                        eval_state,
-                        model_cls,
-                        testloader,
-                        seq_len,
-                        in_dim,
-                        args.batchnorm,
-                    )
-                else:
-                    print(f"[*] Running HW Variation-Aware Epoch {aware_epoch + 1} Test...")
-                    aware_val_loss, aware_val_acc = validate(
-                        eval_state,
-                        model_cls,
-                        testloader,
-                        seq_len,
-                        in_dim,
-                        args.batchnorm,
-                    )
-                    aware_test_loss, aware_test_acc = aware_val_loss, aware_val_acc
+                    train_losses.append(float(sample_train_loss))
 
+                    nominal_params, projection_report = project_params_tree(
+                        params=state.params,
+                        ssm_param=args.ssm_param,
+                        sample_rate=getattr(args, "hw_sample_rate", 16000.0),
+                        projection_config=nominal_config,
+                    )
+                    state = state.replace(params=nominal_params)
+
+                aware_train_loss = float(np.mean(np.asarray(train_losses, dtype=np.float32)))
+                val_losses = []
+                val_accs = []
+                test_losses = []
+                test_accs = []
+                for sample_index in range(aware_eval_samples):
+                    variation_seed = _hw_variation_aware_eval_seed(
+                        aware_seed,
+                        aware_epoch,
+                        sample_index,
+                        aware_eval_samples,
+                    )
+                    varied_config = _hw_projection_config(
+                        args,
+                        variation_sigma=aware_sigma,
+                        variation_seed=variation_seed,
+                    )
+                    eval_params, projection_report = project_params_tree(
+                        params=state.params,
+                        ssm_param=args.ssm_param,
+                        sample_rate=getattr(args, "hw_sample_rate", 16000.0),
+                        projection_config=varied_config,
+                    )
+                    eval_state = state.replace(params=eval_params)
+                    if valloader is not None:
+                        print(
+                            "[*] Running HW Variation-Aware Epoch {} Validation Sample {} (seed={})...".format(
+                                aware_epoch + 1,
+                                sample_index + 1,
+                                variation_seed,
+                            )
+                        )
+                        aware_val_loss, aware_val_acc = validate(
+                            eval_state,
+                            model_cls,
+                            valloader,
+                            seq_len,
+                            in_dim,
+                            args.batchnorm,
+                        )
+                        print(
+                            "[*] Running HW Variation-Aware Epoch {} Test Sample {} (seed={})...".format(
+                                aware_epoch + 1,
+                                sample_index + 1,
+                                variation_seed,
+                            )
+                        )
+                        aware_test_loss, aware_test_acc = validate(
+                            eval_state,
+                            model_cls,
+                            testloader,
+                            seq_len,
+                            in_dim,
+                            args.batchnorm,
+                        )
+                    else:
+                        print(
+                            "[*] Running HW Variation-Aware Epoch {} Test Sample {} (seed={})...".format(
+                                aware_epoch + 1,
+                                sample_index + 1,
+                                variation_seed,
+                            )
+                        )
+                        aware_val_loss, aware_val_acc = validate(
+                            eval_state,
+                            model_cls,
+                            testloader,
+                            seq_len,
+                            in_dim,
+                            args.batchnorm,
+                        )
+                        aware_test_loss, aware_test_acc = aware_val_loss, aware_val_acc
+                    val_losses.append(float(aware_val_loss))
+                    val_accs.append(float(aware_val_acc))
+                    test_losses.append(float(aware_test_loss))
+                    test_accs.append(float(aware_test_acc))
+
+                aware_val_loss = float(np.mean(np.asarray(val_losses, dtype=np.float32)))
+                aware_val_acc = _hw_variation_aware_score(val_accs, aware_select_metric)
+                aware_test_loss = float(np.mean(np.asarray(test_losses, dtype=np.float32)))
+                aware_test_acc = float(np.mean(np.asarray(test_accs, dtype=np.float32)))
                 aggregate = projection_report.get("aggregate", {})
                 print(f"\n=>> HW Variation-Aware Epoch {aware_epoch + 1} Metrics ===")
                 print(
-                    f"\tTrain Loss: {aware_train_loss:.5f} -- Var Val Loss: {aware_val_loss:.5f} --"
-                    f" Var Test Loss: {aware_test_loss:.5f} -- Var Val Accuracy: {aware_val_acc:.4f}"
-                    f" Var Test Accuracy: {aware_test_acc:.4f}"
+                    f"\tTrain Loss: {aware_train_loss:.5f} -- Mean Var Val Loss: {aware_val_loss:.5f} --"
+                    f" Mean Var Test Loss: {aware_test_loss:.5f} -- Mean Var Val Accuracy: {aware_val_acc:.4f}"
+                    f" Mean Var Test Accuracy: {aware_test_acc:.4f}"
                 )
 
                 if aware_val_acc > best_aware_acc:

@@ -12,11 +12,14 @@ variation, without running LTSpice. For each variation setting it writes:
 from __future__ import annotations
 
 import argparse
+import csv
+import glob
 import json
 import sys
 from functools import partial
 from pathlib import Path
 
+import numpy as np
 from jax import random
 
 from run_train import normalize_config_overrides
@@ -38,7 +41,7 @@ from s5.utils.util import str2bool
 from .export_full_model import export_full_model
 from .export_netlist import load_flax_params
 from .hardware_projection import HardwareProjectionConfig
-from .hardware_projector import save_projected_params
+from .hardware_projector import project_params_tree, save_projected_params
 
 
 def _parse_sweep_values(values, cast):
@@ -62,6 +65,66 @@ def _sigma_label(value):
 
 def _case_name(sigma, variation_seed):
     return f"v{_sigma_label(sigma)}_seed{int(variation_seed)}"
+
+
+def _expand_params(values):
+    paths = []
+    for value in values:
+        matches = sorted(glob.glob(str(value)))
+        paths.extend(matches or [str(value)])
+    expanded = [Path(path) for path in paths]
+    missing = [str(path) for path in expanded if not path.exists()]
+    if missing:
+        raise FileNotFoundError("Missing checkpoint(s): {}".format(", ".join(missing)))
+    return expanded
+
+
+def _checkpoint_metadata(path):
+    stem = Path(path).stem
+    seed = None
+    kind = "params"
+    for part in stem.split("_"):
+        if part.startswith("seed"):
+            try:
+                seed = int(part.removeprefix("seed"))
+            except ValueError:
+                seed = None
+    if stem.endswith("_variation_aware"):
+        kind = "variation_aware"
+    elif stem.endswith("_calibrated") or stem.endswith("_projected"):
+        kind = "calibrated"
+    return seed, kind
+
+
+def _summarize_rows(rows):
+    groups = {}
+    for row in rows:
+        key = (row["checkpoint"], row["checkpoint_seed"], row["checkpoint_kind"], row["variation_sigma"])
+        groups.setdefault(key, []).append(row)
+    summary = []
+    for (checkpoint, checkpoint_seed, checkpoint_kind, sigma), items in sorted(groups.items()):
+        accs = np.asarray([item["test_accuracy"] for item in items], dtype=np.float64)
+        summary.append(
+            {
+                "checkpoint": checkpoint,
+                "checkpoint_seed": checkpoint_seed,
+                "checkpoint_kind": checkpoint_kind,
+                "variation_sigma": sigma,
+                "mean_accuracy": float(np.mean(accs)),
+                "std_accuracy": float(np.std(accs)),
+                "min_accuracy": float(np.min(accs)),
+                "max_accuracy": float(np.max(accs)),
+                "num_runs": int(len(items)),
+            }
+        )
+    return summary
+
+
+def _write_csv(path, rows, fieldnames):
+    with Path(path).open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _create_dataset(args):
@@ -205,91 +268,119 @@ def run(args):
     retrieval = args.dataset in ["aan-classification"]
     model_cls, base_state = _build_model_and_state(args, n_classes, seq_len, in_dim, padded, retrieval)
 
-    original_params = load_flax_params(args.params)
-    original_state = base_state.replace(params=original_params)
-    original_loss, original_acc = validate(
-        original_state,
-        model_cls,
-        testloader,
-        seq_len,
-        in_dim,
-        args.batchnorm,
-    )
-
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    params_paths = _expand_params(args.params)
     sigmas = _parse_sweep_values(args.variation_sigma, float) or [0.0]
     seeds = _parse_sweep_values(args.variation_seed, int) or [0]
 
     rows = []
-    for sigma in sigmas:
-        for variation_seed in seeds:
-            case = _case_name(sigma, variation_seed)
-            case_dir = out_dir / case
-            case_dir.mkdir(parents=True, exist_ok=True)
-            config = _projection_config(args, sigma, variation_seed)
-
-            projected_params_path, projection_report = save_projected_params(
-                args.params,
-                args.ssm_param,
-                args.sample_rate,
-                config,
-                case_dir / "params.msgpack",
-            )
-            export_full_model(
-                args.params,
-                args.ssm_param,
-                args.sample_rate,
-                case_dir / "full_model.cir",
-                json_out=case_dir / "full_model_manifest.json",
-                projection_config=config,
-                projection_report=case_dir / "projection_report.json",
-            )
-
-            projected_params = load_flax_params(projected_params_path)
-            projected_state = base_state.replace(params=projected_params)
-            test_loss, test_acc = validate(
-                projected_state,
-                model_cls,
-                testloader,
-                seq_len,
-                in_dim,
-                args.batchnorm,
-            )
-            aggregate = projection_report.get("aggregate", {})
-            row = {
-                "case": case,
-                "variation_sigma": float(sigma),
-                "variation_seed": int(variation_seed),
-                "test_loss": float(test_loss),
-                "test_accuracy": float(test_acc),
-                "clip_fraction": float(aggregate.get("clip_fraction", 0.0)),
-                "num_clipped_low": int(aggregate.get("num_clipped_low", 0)),
-                "num_clipped_high": int(aggregate.get("num_clipped_high", 0)),
-                "num_conductances": int(aggregate.get("num_conductances", 0)),
-                "projected_params": str(projected_params_path),
-                "full_model_cir": str(case_dir / "full_model.cir"),
-                "projection_report": str(case_dir / "projection_report.json"),
+    originals = []
+    for params_path in params_paths:
+        original_params = load_flax_params(params_path)
+        original_state = base_state.replace(params=original_params)
+        original_loss, original_acc = validate(
+            original_state,
+            model_cls,
+            testloader,
+            seq_len,
+            in_dim,
+            args.batchnorm,
+        )
+        checkpoint_seed, checkpoint_kind = _checkpoint_metadata(params_path)
+        originals.append(
+            {
+                "checkpoint": str(params_path),
+                "checkpoint_seed": checkpoint_seed,
+                "checkpoint_kind": checkpoint_kind,
+                "test_loss": float(original_loss),
+                "test_accuracy": float(original_acc),
             }
-            rows.append(row)
-            print(
-                "{case}: sigma={sigma:.6g} seed={seed} acc={acc:.4f} clip={clip:.4f}".format(
-                    case=case,
-                    sigma=float(sigma),
-                    seed=int(variation_seed),
-                    acc=float(test_acc),
-                    clip=row["clip_fraction"],
-                )
-            )
+        )
 
+        for sigma in sigmas:
+            for variation_seed in seeds:
+                case = _case_name(sigma, variation_seed)
+                config = _projection_config(args, sigma, variation_seed)
+
+                projected_params_path = ""
+                full_model_cir = ""
+                projection_report_path = ""
+                if args.export_netlist:
+                    case_dir = out_dir / params_path.stem / case
+                    case_dir.mkdir(parents=True, exist_ok=True)
+                    projected_params_path, projection_report = save_projected_params(
+                        params_path,
+                        args.ssm_param,
+                        args.sample_rate,
+                        config,
+                        case_dir / "params.msgpack",
+                    )
+                    export_full_model(
+                        params_path,
+                        args.ssm_param,
+                        args.sample_rate,
+                        case_dir / "full_model.cir",
+                        json_out=case_dir / "full_model_manifest.json",
+                        projection_config=config,
+                        projection_report=case_dir / "projection_report.json",
+                    )
+                    projected_params = load_flax_params(projected_params_path)
+                    full_model_cir = str(case_dir / "full_model.cir")
+                    projection_report_path = str(case_dir / "projection_report.json")
+                else:
+                    projected_params, projection_report = project_params_tree(
+                        original_params,
+                        args.ssm_param,
+                        args.sample_rate,
+                        config,
+                    )
+
+                projected_state = base_state.replace(params=projected_params)
+                test_loss, test_acc = validate(
+                    projected_state,
+                    model_cls,
+                    testloader,
+                    seq_len,
+                    in_dim,
+                    args.batchnorm,
+                )
+                aggregate = projection_report.get("aggregate", {})
+                row = {
+                    "checkpoint": str(params_path),
+                    "checkpoint_seed": checkpoint_seed,
+                    "checkpoint_kind": checkpoint_kind,
+                    "case": case,
+                    "variation_sigma": float(sigma),
+                    "variation_seed": int(variation_seed),
+                    "test_loss": float(test_loss),
+                    "test_accuracy": float(test_acc),
+                    "clip_fraction": float(aggregate.get("clip_fraction", 0.0)),
+                    "num_clipped_low": int(aggregate.get("num_clipped_low", 0)),
+                    "num_clipped_high": int(aggregate.get("num_clipped_high", 0)),
+                    "num_conductances": int(aggregate.get("num_conductances", 0)),
+                    "projected_params": str(projected_params_path),
+                    "full_model_cir": full_model_cir,
+                    "projection_report": projection_report_path,
+                }
+                rows.append(row)
+                print(
+                    "{checkpoint} {case}: sigma={sigma:.6g} seed={seed} acc={acc:.4f} clip={clip:.4f}".format(
+                        checkpoint=params_path.name,
+                        case=case,
+                        sigma=float(sigma),
+                        seed=int(variation_seed),
+                        acc=float(test_acc),
+                        clip=row["clip_fraction"],
+                    )
+                )
+
+    aggregate_rows = _summarize_rows(rows)
     summary = {
-        "params": str(args.params),
+        "params": [str(path) for path in params_paths],
         "ssm_param": args.ssm_param,
         "sample_rate": float(args.sample_rate),
-        "original": {
-            "test_loss": float(original_loss),
-            "test_accuracy": float(original_acc),
-        },
+        "originals": originals,
         "projection": {
             "projection_scope": args.projection_scope,
             "g_min": float(args.g_min),
@@ -298,17 +389,19 @@ def run(args):
             "c_max": float(args.c_max),
         },
         "runs": rows,
+        "aggregate": aggregate_rows,
     }
     summary_path = out_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
-    print(f"original acc={float(original_acc):.4f}")
+    _write_csv(out_dir / "summary.csv", rows, list(rows[0].keys()) if rows else [])
+    _write_csv(out_dir / "aggregate.csv", aggregate_rows, list(aggregate_rows[0].keys()) if aggregate_rows else [])
     print(f"wrote {summary_path}")
     return summary
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--params", required=True)
+    parser.add_argument("--params", nargs="+", required=True)
     parser.add_argument("--out-dir", default="out/digital_variation")
     parser.add_argument("--dataset", choices=Datasets.keys(), default="mnist-classification")
     parser.add_argument("--dir-name", "--dir_name", default="./cache_dir")
@@ -352,6 +445,7 @@ def parse_args(argv=None):
     parser.add_argument("--c-max", "--c_max", type=float, default=1e-9)
     parser.add_argument("--variation-sigma", "--variation_sigma", nargs="*", default=["0.0"])
     parser.add_argument("--variation-seed", "--variation_seed", nargs="*", default=["0"])
+    parser.add_argument("--export-netlist", "--export_netlist", type=str2bool, default=False)
 
     parser.add_argument("--synthetic-seq-len", "--synthetic_seq_len", type=int, default=256)
     parser.add_argument("--synthetic-noise-std", "--synthetic_noise_std", type=float, default=0.25)

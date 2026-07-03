@@ -1,7 +1,19 @@
+import subprocess
+import sys
+
 import jax.numpy as np
 import pytest
 
-from s5.train import _hw_calibration_enabled, _hw_calibrated_params_out, _hw_variation_aware_params_out
+from s5.train import (
+    _hw_calibration_enabled,
+    _hw_calibrated_params_out,
+    _hw_variation_aware_eval_seed,
+    _hw_variation_aware_eval_samples,
+    _hw_variation_aware_params_out,
+    _hw_variation_aware_score,
+    _hw_variation_aware_train_seed,
+    _hw_variation_aware_train_samples,
+)
 from s5.train_helpers import (
     analog_calibration_param_labels,
     create_hw_calibration_optimizer,
@@ -115,3 +127,36 @@ def test_hw_variation_aware_params_out_defaults_beside_params_out():
 
     args.hw_variation_aware_params_out = "./checkpoints/aware.msgpack"
     assert str(_hw_variation_aware_params_out(args)).endswith("aware.msgpack")
+
+
+def test_hw_variation_aware_samples_and_seed_schedule():
+    args = Args()
+    assert _hw_variation_aware_train_samples(args) == 3
+    assert _hw_variation_aware_eval_samples(args) == 3
+
+    args.hw_variation_aware_train_samples = 0
+    args.hw_variation_aware_eval_samples = -2
+    assert _hw_variation_aware_train_samples(args) == 1
+    assert _hw_variation_aware_eval_samples(args) == 1
+
+    assert _hw_variation_aware_train_seed(7, epoch=2, sample_index=1, train_samples=3) == 14
+    assert _hw_variation_aware_eval_seed(7, epoch=2, sample_index=1, eval_samples=3) == 10014
+
+
+def test_hw_variation_aware_selection_uses_mean_accuracy():
+    assert _hw_variation_aware_score([0.7, 0.8, 0.9], "mean_acc") == pytest.approx(0.8)
+    with pytest.raises(ValueError, match="Unknown variation-aware selection metric"):
+        _hw_variation_aware_score([0.7], "min_acc")
+
+
+def test_run_train_exposes_variation_aware_cli_flags():
+    result = subprocess.run(
+        [sys.executable, "run_train.py", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--hw_variation_aware_train_samples" in result.stdout
+    assert "--hw_variation_aware_eval_samples" in result.stdout
+    assert "--hw_variation_aware_select_metric" in result.stdout
