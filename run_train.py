@@ -127,7 +127,7 @@ if __name__ == "__main__":
 						help="Number of varied projections used for each variation-aware calibration epoch.")
 	parser.add_argument("--hw_variation_aware_eval_samples", type=int, default=3,
 						help="Number of varied projections used to select each variation-aware checkpoint.")
-	parser.add_argument("--hw_variation_aware_select_metric", type=str, default="mean_acc", choices=["mean_acc"],
+	parser.add_argument("--hw_variation_aware_select_metric", type=str, default="mean_acc", choices=["mean_acc", "mean_std"],
 						help="Metric used to select the best variation-aware checkpoint.")
 	parser.add_argument("--hw_calibrated_params_out", type=str, default=None,
 						help="Path for best hardware-calibrated params; defaults beside --params_out.")

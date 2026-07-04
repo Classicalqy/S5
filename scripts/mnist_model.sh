@@ -40,11 +40,12 @@ for seed in 0 1 2 3 4; do
     hw_c_min=1e-12 \
     hw_c_max=1e-9 \
     hw_variation_sigma=0.0 \
-    hw_variation_aware_epochs=5 \
-    hw_variation_aware_sigma=0.01 \
+    hw_variation_aware_epochs=8 \
+    hw_variation_aware_sigma=0.015 \
     hw_variation_aware_seed=$seed \
     hw_variation_aware_train_samples=3 \
-    hw_variation_aware_eval_samples=3 \
+    hw_variation_aware_eval_samples=5 \
+    hw_variation_aware_select_metric=mean_std \
     params_out=${base}.msgpack \
     hw_calibrated_params_out=${base}_calibrated.msgpack \
     hw_variation_aware_params_out=${base}_variation_aware.msgpack

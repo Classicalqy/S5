@@ -102,9 +102,12 @@ def _hw_variation_aware_eval_seed(base_seed, epoch, sample_index, eval_samples):
 
 
 def _hw_variation_aware_score(val_accuracies, select_metric):
-    if select_metric != "mean_acc":
-        raise ValueError(f"Unknown variation-aware selection metric: {select_metric}")
-    return float(np.mean(np.asarray(val_accuracies, dtype=np.float32)))
+    values = np.asarray(val_accuracies, dtype=np.float32)
+    if select_metric == "mean_acc":
+        return float(np.mean(values))
+    if select_metric == "mean_std":
+        return float(np.mean(values) - 0.5 * np.std(values))
+    raise ValueError(f"Unknown variation-aware selection metric: {select_metric}")
 
 
 def train(args):

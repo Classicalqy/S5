@@ -145,6 +145,7 @@ def test_hw_variation_aware_samples_and_seed_schedule():
 
 def test_hw_variation_aware_selection_uses_mean_accuracy():
     assert _hw_variation_aware_score([0.7, 0.8, 0.9], "mean_acc") == pytest.approx(0.8)
+    assert _hw_variation_aware_score([0.7, 0.8, 0.9], "mean_std") == pytest.approx(0.8 - 0.5 * 0.08164966)
     with pytest.raises(ValueError, match="Unknown variation-aware selection metric"):
         _hw_variation_aware_score([0.7], "min_acc")
 
@@ -160,3 +161,4 @@ def test_run_train_exposes_variation_aware_cli_flags():
     assert "--hw_variation_aware_train_samples" in result.stdout
     assert "--hw_variation_aware_eval_samples" in result.stdout
     assert "--hw_variation_aware_select_metric" in result.stdout
+    assert "mean_std" in result.stdout
