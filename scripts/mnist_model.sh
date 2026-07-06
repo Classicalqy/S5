@@ -41,10 +41,10 @@ for seed in 0 1 2 3 4; do
     hw_c_max=1e-9 \
     hw_variation_sigma=0.0 \
     hw_variation_aware_epochs=8 \
-    hw_variation_aware_sigma=0.015 \
+    hw_variation_aware_sigma=0.05 \
     hw_variation_aware_seed=$seed \
-    hw_variation_aware_train_samples=3 \
-    hw_variation_aware_eval_samples=5 \
+    hw_variation_aware_train_samples=8 \
+    hw_variation_aware_eval_samples=20 \
     hw_variation_aware_select_metric=mean_std \
     params_out=${base}.msgpack \
     hw_calibrated_params_out=${base}_calibrated.msgpack \
@@ -72,5 +72,5 @@ python -m spice.digital_variation_test \
   --bsz 64 \
   --c-min 1e-12 \
   --c-max 1e-9 \
-  --variation-sigma 0 0.005 0.01 0.02 \
+  --variation-sigma 0 0.005 0.01 0.02 0.05 0.075 0.10 \
   --variation-seed 0 1 2 3 4

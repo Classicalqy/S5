@@ -30,5 +30,5 @@ python -m spice.digital_variation_test \
   --bsz 64 \
   --c-min 1e-12 \
   --c-max 1e-9 \
-  --variation-sigma 0 0.005 0.01 0.02 \
+  --variation-sigma 0 0.005 0.01 0.02 0.05 0.075 0.10 \
   --variation-seed 0 1 2 3 4
