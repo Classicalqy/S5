@@ -93,6 +93,48 @@ def _hw_variation_aware_eval_samples(args):
     return max(1, int(getattr(args, "hw_variation_aware_eval_samples", 3)))
 
 
+def _parse_hw_variation_aware_sigma_schedule(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        pieces = []
+        for item in value:
+            pieces.extend(str(item).replace(",", " ").split())
+    else:
+        pieces = str(value).replace(",", " ").split()
+    values = [float(piece) for piece in pieces if piece]
+    if any(sigma < 0.0 for sigma in values):
+        raise ValueError("Variation-aware sigma schedule values must be non-negative.")
+    return values
+
+
+def _hw_variation_aware_sigma_schedule(args):
+    schedule = _parse_hw_variation_aware_sigma_schedule(
+        getattr(args, "hw_variation_aware_sigma_schedule", None)
+    )
+    if schedule:
+        return schedule
+    return [float(getattr(args, "hw_variation_aware_sigma", 0.0))]
+
+
+def _hw_variation_aware_epoch_sigma(args, epoch):
+    schedule = _hw_variation_aware_sigma_schedule(args)
+    return float(schedule[min(int(epoch), len(schedule) - 1)])
+
+
+def _hw_variation_aware_nominal_fraction(args):
+    value = float(getattr(args, "hw_variation_aware_nominal_fraction", 0.0))
+    return min(1.0, max(0.0, value))
+
+
+def _hw_variation_aware_nominal_train_samples(train_samples, nominal_fraction):
+    train_samples = max(1, int(train_samples))
+    nominal_fraction = min(1.0, max(0.0, float(nominal_fraction)))
+    if nominal_fraction <= 0.0:
+        return 0
+    return min(train_samples, max(1, int(round(train_samples * nominal_fraction))))
+
+
 def _hw_variation_aware_train_seed(base_seed, epoch, sample_index, train_samples):
     return int(base_seed) + int(epoch) * int(train_samples) + int(sample_index)
 
@@ -102,11 +144,28 @@ def _hw_variation_aware_eval_seed(base_seed, epoch, sample_index, eval_samples):
 
 
 def _hw_variation_aware_score(val_accuracies, select_metric):
-    values = np.asarray(val_accuracies, dtype=np.float32)
+    values = [float(value) for value in val_accuracies]
+    if not values:
+        raise ValueError("Cannot score variation-aware checkpoint without validation accuracies.")
     if select_metric == "mean_acc":
-        return float(np.mean(values))
+        return float(np.mean(np.asarray(values, dtype=np.float32)))
     if select_metric == "mean_std":
+        values = np.asarray(values, dtype=np.float32)
         return float(np.mean(values) - 0.5 * np.std(values))
+    if select_metric == "mean_std_strong":
+        values = np.asarray(values, dtype=np.float32)
+        return float(np.mean(values) - np.std(values))
+    if select_metric == "min_acc":
+        return float(min(values))
+    if select_metric == "p10_acc":
+        values = sorted(values)
+        if len(values) == 1:
+            return float(values[0])
+        position = 0.10 * (len(values) - 1)
+        lower = int(np.floor(position))
+        upper = int(np.ceil(position))
+        weight = position - lower
+        return float(values[lower] * (1.0 - weight) + values[upper] * weight)
     raise ValueError(f"Unknown variation-aware selection metric: {select_metric}")
 
 
@@ -701,18 +760,25 @@ def train(args):
         wandb.run.summary["HW Calibration Params Out"] = str(calibrated_out)
 
         if _hw_variation_aware_enabled(args):
-            aware_sigma = float(getattr(args, "hw_variation_aware_sigma", 0.0))
+            aware_sigma_schedule = _hw_variation_aware_sigma_schedule(args)
             aware_seed = int(getattr(args, "hw_variation_aware_seed", 0))
             aware_train_samples = _hw_variation_aware_train_samples(args)
             aware_eval_samples = _hw_variation_aware_eval_samples(args)
             aware_select_metric = getattr(args, "hw_variation_aware_select_metric", "mean_acc")
+            aware_nominal_fraction = _hw_variation_aware_nominal_fraction(args)
+            aware_nominal_samples = _hw_variation_aware_nominal_train_samples(
+                aware_train_samples,
+                aware_nominal_fraction,
+            )
             nominal_config = _hw_projection_config(args, variation_sigma=0.0)
             print(
-                "[*] Starting variation-aware analog calibration with sigma={:.6g}, "
-                "train_samples={}, eval_samples={}...".format(
-                    aware_sigma,
+                "[*] Starting variation-aware analog calibration with sigma_schedule={}, "
+                "train_samples={}, eval_samples={}, nominal_train_samples={}, select_metric={}...".format(
+                    ",".join("{:.6g}".format(sigma) for sigma in aware_sigma_schedule),
                     aware_train_samples,
                     aware_eval_samples,
+                    aware_nominal_samples,
+                    aware_select_metric,
                 )
             )
 
@@ -739,8 +805,10 @@ def train(args):
             best_aware_epoch = 0
 
             for aware_epoch in range(int(args.hw_variation_aware_epochs)):
+                aware_sigma = _hw_variation_aware_epoch_sigma(args, aware_epoch)
                 train_losses = []
                 for sample_index in range(aware_train_samples):
+                    sample_sigma = 0.0 if sample_index < aware_nominal_samples else aware_sigma
                     variation_seed = _hw_variation_aware_train_seed(
                         aware_seed,
                         aware_epoch,
@@ -749,7 +817,7 @@ def train(args):
                     )
                     varied_config = _hw_projection_config(
                         args,
-                        variation_sigma=aware_sigma,
+                        variation_sigma=sample_sigma,
                         variation_seed=variation_seed,
                     )
                     varied_params, projection_report = project_params_tree(
@@ -761,9 +829,10 @@ def train(args):
                     state = state.replace(params=varied_params)
 
                     print(
-                        "[*] Starting HW Variation-Aware Epoch {} Sample {} (seed={})...".format(
+                        "[*] Starting HW Variation-Aware Epoch {} Sample {} (sigma={:.6g}, seed={})...".format(
                             aware_epoch + 1,
                             sample_index + 1,
+                            sample_sigma,
                             variation_seed,
                         )
                     )
@@ -813,9 +882,10 @@ def train(args):
                     eval_state = state.replace(params=eval_params)
                     if valloader is not None:
                         print(
-                            "[*] Running HW Variation-Aware Epoch {} Validation Sample {} (seed={})...".format(
+                            "[*] Running HW Variation-Aware Epoch {} Validation Sample {} (sigma={:.6g}, seed={})...".format(
                                 aware_epoch + 1,
                                 sample_index + 1,
+                                aware_sigma,
                                 variation_seed,
                             )
                         )
@@ -828,9 +898,10 @@ def train(args):
                             args.batchnorm,
                         )
                         print(
-                            "[*] Running HW Variation-Aware Epoch {} Test Sample {} (seed={})...".format(
+                            "[*] Running HW Variation-Aware Epoch {} Test Sample {} (sigma={:.6g}, seed={})...".format(
                                 aware_epoch + 1,
                                 sample_index + 1,
+                                aware_sigma,
                                 variation_seed,
                             )
                         )
@@ -844,9 +915,10 @@ def train(args):
                         )
                     else:
                         print(
-                            "[*] Running HW Variation-Aware Epoch {} Test Sample {} (seed={})...".format(
+                            "[*] Running HW Variation-Aware Epoch {} Test Sample {} (sigma={:.6g}, seed={})...".format(
                                 aware_epoch + 1,
                                 sample_index + 1,
+                                aware_sigma,
                                 variation_seed,
                             )
                         )
@@ -873,7 +945,7 @@ def train(args):
                 print(
                     f"\tTrain Loss: {aware_train_loss:.5f} -- Mean Var Val Loss: {aware_val_loss:.5f} --"
                     f" Mean Var Test Loss: {aware_test_loss:.5f} -- Mean Var Val Accuracy: {aware_val_acc:.4f}"
-                    f" Mean Var Test Accuracy: {aware_test_acc:.4f}"
+                    f" Mean Var Test Accuracy: {aware_test_acc:.4f} -- Sigma: {aware_sigma:.6g}"
                 )
 
                 if aware_val_acc > best_aware_acc:
@@ -893,6 +965,7 @@ def train(args):
                         "HW Variation-Aware Val Accuracy": aware_val_acc,
                         "HW Variation-Aware Test Loss": aware_test_loss,
                         "HW Variation-Aware Test Accuracy": aware_test_acc,
+                        "HW Variation-Aware Sigma": aware_sigma,
                     }
                 )
 

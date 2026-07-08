@@ -121,13 +121,17 @@ if __name__ == "__main__":
 						help="Extra analog calibration epochs with random component variation.")
 	parser.add_argument("--hw_variation_aware_sigma", type=float, default=0.0,
 						help="Component variation sigma used by variation-aware analog calibration.")
+	parser.add_argument("--hw_variation_aware_sigma_schedule", type=str, default=None,
+						help="Comma- or space-separated per-epoch sigma curriculum for variation-aware analog calibration. Reuses the last value after the schedule ends.")
 	parser.add_argument("--hw_variation_aware_seed", type=int, default=0,
 						help="Base random seed for variation-aware analog calibration.")
 	parser.add_argument("--hw_variation_aware_train_samples", type=int, default=3,
 						help="Number of varied projections used for each variation-aware calibration epoch.")
 	parser.add_argument("--hw_variation_aware_eval_samples", type=int, default=3,
 						help="Number of varied projections used to select each variation-aware checkpoint.")
-	parser.add_argument("--hw_variation_aware_select_metric", type=str, default="mean_acc", choices=["mean_acc", "mean_std"],
+	parser.add_argument("--hw_variation_aware_nominal_fraction", type=float, default=0.0,
+						help="Fraction of variation-aware train samples kept at sigma=0 to preserve nominal accuracy.")
+	parser.add_argument("--hw_variation_aware_select_metric", type=str, default="mean_acc", choices=["mean_acc", "mean_std", "mean_std_strong", "min_acc", "p10_acc"],
 						help="Metric used to select the best variation-aware checkpoint.")
 	parser.add_argument("--hw_calibrated_params_out", type=str, default=None,
 						help="Path for best hardware-calibrated params; defaults beside --params_out.")

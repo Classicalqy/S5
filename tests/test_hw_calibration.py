@@ -7,10 +7,14 @@ import pytest
 from s5.train import (
     _hw_calibration_enabled,
     _hw_calibrated_params_out,
+    _hw_variation_aware_epoch_sigma,
     _hw_variation_aware_eval_seed,
     _hw_variation_aware_eval_samples,
+    _hw_variation_aware_nominal_fraction,
+    _hw_variation_aware_nominal_train_samples,
     _hw_variation_aware_params_out,
     _hw_variation_aware_score,
+    _hw_variation_aware_sigma_schedule,
     _hw_variation_aware_train_seed,
     _hw_variation_aware_train_samples,
 )
@@ -143,11 +147,41 @@ def test_hw_variation_aware_samples_and_seed_schedule():
     assert _hw_variation_aware_eval_seed(7, epoch=2, sample_index=1, eval_samples=3) == 10014
 
 
+def test_hw_variation_aware_sigma_schedule_reuses_last_value():
+    args = Args()
+    args.hw_variation_aware_sigma = 0.05
+    assert _hw_variation_aware_sigma_schedule(args) == [0.05]
+    assert _hw_variation_aware_epoch_sigma(args, 3) == pytest.approx(0.05)
+
+    args.hw_variation_aware_sigma_schedule = "0.02,0.05 0.1"
+    assert _hw_variation_aware_sigma_schedule(args) == [0.02, 0.05, 0.1]
+    assert _hw_variation_aware_epoch_sigma(args, 0) == pytest.approx(0.02)
+    assert _hw_variation_aware_epoch_sigma(args, 1) == pytest.approx(0.05)
+    assert _hw_variation_aware_epoch_sigma(args, 4) == pytest.approx(0.1)
+
+
+def test_hw_variation_aware_nominal_mix_clamps_and_counts_samples():
+    args = Args()
+    assert _hw_variation_aware_nominal_fraction(args) == 0.0
+    assert _hw_variation_aware_nominal_train_samples(6, 0.0) == 0
+    assert _hw_variation_aware_nominal_train_samples(6, 0.2) == 1
+    assert _hw_variation_aware_nominal_train_samples(6, 0.5) == 3
+    assert _hw_variation_aware_nominal_train_samples(6, 2.0) == 6
+
+    args.hw_variation_aware_nominal_fraction = -1.0
+    assert _hw_variation_aware_nominal_fraction(args) == 0.0
+    args.hw_variation_aware_nominal_fraction = 2.0
+    assert _hw_variation_aware_nominal_fraction(args) == 1.0
+
+
 def test_hw_variation_aware_selection_uses_mean_accuracy():
     assert _hw_variation_aware_score([0.7, 0.8, 0.9], "mean_acc") == pytest.approx(0.8)
     assert _hw_variation_aware_score([0.7, 0.8, 0.9], "mean_std") == pytest.approx(0.8 - 0.5 * 0.08164966)
+    assert _hw_variation_aware_score([0.7, 0.8, 0.9], "mean_std_strong") == pytest.approx(0.8 - 0.08164966)
+    assert _hw_variation_aware_score([0.7, 0.8, 0.9], "min_acc") == pytest.approx(0.7)
+    assert _hw_variation_aware_score([0.7, 0.8, 0.9], "p10_acc") == pytest.approx(0.72)
     with pytest.raises(ValueError, match="Unknown variation-aware selection metric"):
-        _hw_variation_aware_score([0.7], "min_acc")
+        _hw_variation_aware_score([0.7], "unknown_metric")
 
 
 def test_run_train_exposes_variation_aware_cli_flags():
@@ -160,5 +194,8 @@ def test_run_train_exposes_variation_aware_cli_flags():
 
     assert "--hw_variation_aware_train_samples" in result.stdout
     assert "--hw_variation_aware_eval_samples" in result.stdout
+    assert "--hw_variation_aware_sigma_schedule" in result.stdout
+    assert "--hw_variation_aware_nominal_fraction" in result.stdout
     assert "--hw_variation_aware_select_metric" in result.stdout
     assert "mean_std" in result.stdout
+    assert "p10_acc" in result.stdout
