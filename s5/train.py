@@ -15,6 +15,7 @@ from .train_helpers import (
     constant_lr,
     reduce_lr_on_plateau,
     reset_optimizer,
+    stack_variation_offsets,
     train_epoch,
     validate,
     variation_aware_calibration_epoch,
@@ -847,16 +848,16 @@ def train(args):
                         )
                     )
 
-                def varied_params_for_batch(master_params):
-                    return [
-                        project_params_tree(
-                            params=master_params,
-                            ssm_param=args.ssm_param,
-                            sample_rate=getattr(args, "hw_sample_rate", 16000.0),
-                            projection_config=config,
-                        )[0]
-                        for config in train_configs
-                    ]
+                varied_params = [
+                    project_params_tree(
+                        params=state.params,
+                        ssm_param=args.ssm_param,
+                        sample_rate=getattr(args, "hw_sample_rate", 16000.0),
+                        projection_config=config,
+                    )[0]
+                    for config in train_configs
+                ]
+                variation_offsets = stack_variation_offsets(state.params, varied_params)
 
                 print(
                     "[*] Starting HW Variation-Aware Epoch {} EOT calibration "
@@ -875,7 +876,7 @@ def train(args):
                     seq_len,
                     in_dim,
                     args.batchnorm,
-                    varied_params_for_batch,
+                    variation_offsets,
                     aware_train_samples,
                 )
                 aware_train_loss = float(aware_train_loss)

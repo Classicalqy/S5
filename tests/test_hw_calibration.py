@@ -29,6 +29,7 @@ from s5.train_helpers import (
     analog_calibration_param_labels,
     create_hw_calibration_optimizer,
     decoder_only_param_labels,
+    stack_variation_offsets,
     train_step,
     variation_aware_train_step,
 )
@@ -139,7 +140,36 @@ def test_variation_aware_single_nominal_sample_matches_train_step():
         integration_times,
         model,
         False,
-        [state.params],
+        stack_variation_offsets(state.params, [state.params]),
+    )
+
+    assert float(aware_loss) == pytest.approx(float(regular_loss))
+    for expected, actual in zip(
+        jax.tree_util.tree_leaves(regular_state.params),
+        jax.tree_util.tree_leaves(aware_state.params),
+    ):
+        assert np.allclose(expected, actual)
+
+
+def test_variation_aware_batched_nominal_samples_match_train_step():
+    model, state = _tiny_state()
+    inputs = np.ones((2, 1))
+    labels = np.array([0, 1])
+    integration_times = np.ones((2, 1))
+    rng = jax.random.PRNGKey(3)
+
+    regular_state, regular_loss = train_step(
+        state, rng, inputs, labels, integration_times, model, False
+    )
+    aware_state, aware_loss = variation_aware_train_step(
+        state,
+        jax.random.split(rng, 2),
+        inputs,
+        labels,
+        integration_times,
+        model,
+        False,
+        stack_variation_offsets(state.params, [state.params, state.params]),
     )
 
     assert float(aware_loss) == pytest.approx(float(regular_loss))
@@ -165,7 +195,7 @@ def test_variation_aware_step_does_not_replace_master_params_with_chip_params():
         integration_times,
         model,
         False,
-        [chip_params],
+        stack_variation_offsets(state.params, [chip_params]),
     )
 
     for original, updated, chip in zip(

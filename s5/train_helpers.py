@@ -480,15 +480,14 @@ def variation_aware_calibration_epoch(
     seq_len,
     in_dim,
     batchnorm,
-    varied_params_fn,
+    variation_offsets,
     num_samples,
 ):
     """Calibrate master params using the mean gradient from fixed chip samples.
 
-    ``varied_params_fn`` receives the current master parameter tree for every
-    batch and returns one projected tree per hardware realization.  The
-    realizations affect only the forward/gradient evaluation; optimizer updates
-    are always applied to ``state.params`` (the master tree).
+    ``variation_offsets`` stacks one projected-minus-master offset per hardware
+    realization along axis zero. The offsets stay fixed for this epoch, while
+    the master tree is updated after every batch.
     """
     model = model(training=True)
     batch_losses = []
@@ -496,9 +495,6 @@ def variation_aware_calibration_epoch(
 
     for batch in tqdm(trainloader):
         inputs, labels, integration_times = prep_batch(batch, seq_len, in_dim)
-        varied_params = varied_params_fn(state.params)
-        if len(varied_params) != num_samples:
-            raise ValueError("varied_params_fn must return num_samples parameter trees.")
         rng, sample_rng = jax.random.split(rng)
         sample_rngs = jax.random.split(sample_rng, num_samples)
         state, loss = variation_aware_train_step(
@@ -509,7 +505,7 @@ def variation_aware_calibration_epoch(
             integration_times,
             model,
             batchnorm,
-            varied_params,
+            variation_offsets,
         )
         batch_losses.append(loss)
 
@@ -570,42 +566,20 @@ def train_step(state,
     return state, loss
 
 
+def stack_variation_offsets(master_params, varied_params):
+    """Stack projected-minus-master offsets for batched EOT training."""
+    if not varied_params:
+        raise ValueError("variation-aware training requires at least one realization.")
+    return jax.tree_util.tree_map(
+        lambda master, *varied: np.stack(
+            [np.asarray(params) - np.asarray(master) for params in varied], axis=0
+        ),
+        master_params,
+        *varied_params,
+    )
+
+
 @partial(jax.jit, static_argnums=(5, 6))
-def _variation_loss_and_grads(
-    state,
-    rng,
-    batch_inputs,
-    batch_labels,
-    batch_integration_timesteps,
-    model,
-    batchnorm,
-    varied_params,
-):
-    """Evaluate one projected realization without updating the master state."""
-    def loss_fn(params):
-        if batchnorm:
-            logits, mod_vars = model.apply(
-                {"params": params, "batch_stats": state.batch_stats},
-                batch_inputs,
-                batch_integration_timesteps,
-                rngs={"dropout": rng},
-                mutable=["intermediates", "batch_stats"],
-            )
-        else:
-            logits, mod_vars = model.apply(
-                {"params": params},
-                batch_inputs,
-                batch_integration_timesteps,
-                rngs={"dropout": rng},
-                mutable=["intermediates"],
-            )
-        loss = np.mean(cross_entropy_loss(logits, batch_labels))
-        return loss, mod_vars
-
-    (loss, mod_vars), grads = jax.value_and_grad(loss_fn, has_aux=True)(varied_params)
-    return loss, grads, mod_vars.get("batch_stats") if batchnorm else None
-
-
 def variation_aware_train_step(
     state,
     rngs,
@@ -614,41 +588,46 @@ def variation_aware_train_step(
     batch_integration_timesteps,
     model,
     batchnorm,
-    varied_params,
+    variation_offsets,
 ):
-    """Apply an EOT/straight-through update to the master parameter tree.
+    """Run a GPU-batched EOT/straight-through master-parameter update."""
+    rngs = np.asarray(rngs)
 
-    Gradients are evaluated at each projected parameter tree, averaged, and
-    applied directly to ``state.params``.  This is the straight-through
-    estimator for a non-differentiable hardware projection: projection changes
-    the forward model but does not overwrite the master parameters.
-    """
-    if len(varied_params) == 0:
-        raise ValueError("variation-aware training requires at least one realization.")
-    if len(rngs) != len(varied_params):
-        raise ValueError("Expected one RNG key per variation realization.")
+    def loss_and_grads_for_realization(offset, rng):
+        def loss_fn(master_params):
+            varied_params = jax.tree_util.tree_map(
+                lambda master, delta: master + jax.lax.stop_gradient(delta),
+                master_params,
+                offset,
+            )
+            if batchnorm:
+                logits, mod_vars = model.apply(
+                    {"params": varied_params, "batch_stats": state.batch_stats},
+                    batch_inputs,
+                    batch_integration_timesteps,
+                    rngs={"dropout": rng},
+                    mutable=["intermediates", "batch_stats"],
+                )
+            else:
+                logits, mod_vars = model.apply(
+                    {"params": varied_params},
+                    batch_inputs,
+                    batch_integration_timesteps,
+                    rngs={"dropout": rng},
+                    mutable=["intermediates"],
+                )
+            return np.mean(cross_entropy_loss(logits, batch_labels)), mod_vars
 
-    results = [
-        _variation_loss_and_grads(
-            state,
-            rng,
-            batch_inputs,
-            batch_labels,
-            batch_integration_timesteps,
-            model,
-            batchnorm,
-            params,
-        )
-        for rng, params in zip(rngs, varied_params)
-    ]
-    losses, grads, batch_stats = zip(*results)
-    mean_grads = jax.tree_util.tree_map(
-        lambda *leaves: np.mean(np.stack(leaves), axis=0), *grads
+        return jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+
+    (losses, mod_vars), grads = jax.vmap(loss_and_grads_for_realization)(
+        variation_offsets, rngs
     )
-    mean_loss = np.mean(np.stack(losses))
+    mean_grads = jax.tree_util.tree_map(lambda leaves: np.mean(leaves, axis=0), grads)
+    mean_loss = np.mean(losses)
     if batchnorm:
         mean_batch_stats = jax.tree_util.tree_map(
-            lambda *leaves: np.mean(np.stack(leaves), axis=0), *batch_stats
+            lambda leaves: np.mean(leaves, axis=0), mod_vars["batch_stats"]
         )
         state = state.apply_gradients(grads=mean_grads, batch_stats=mean_batch_stats)
     else:
