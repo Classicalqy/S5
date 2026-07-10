@@ -1,8 +1,12 @@
 import subprocess
 import sys
 
+import jax
 import jax.numpy as np
 import pytest
+import optax
+from flax import linen as nn
+from flax.training import train_state
 
 from s5.train import (
     _hw_calibration_enabled,
@@ -14,6 +18,9 @@ from s5.train import (
     _hw_variation_aware_nominal_train_samples,
     _hw_variation_aware_params_out,
     _hw_variation_aware_score,
+    _hw_variation_aware_select_samples,
+    _hw_variation_aware_select_seed,
+    _hw_variation_aware_select_sigma,
     _hw_variation_aware_sigma_schedule,
     _hw_variation_aware_train_seed,
     _hw_variation_aware_train_samples,
@@ -22,11 +29,31 @@ from s5.train_helpers import (
     analog_calibration_param_labels,
     create_hw_calibration_optimizer,
     decoder_only_param_labels,
+    train_step,
+    variation_aware_train_step,
 )
 
 
 class Args:
     pass
+
+
+class _TinyClassifier(nn.Module):
+    @nn.compact
+    def __call__(self, inputs, _integration_times):
+        return nn.Dense(2, use_bias=False)(inputs)
+
+
+def _tiny_state(learning_rate=0.1):
+    model = _TinyClassifier()
+    inputs = np.ones((2, 1))
+    integration_times = np.ones((2, 1))
+    params = model.init(jax.random.PRNGKey(0), inputs, integration_times)["params"]
+    return model, train_state.TrainState.create(
+        apply_fn=model.apply,
+        params=params,
+        tx=optax.sgd(learning_rate),
+    )
 
 
 def test_decoder_only_param_labels_train_only_top_level_decoder():
@@ -94,6 +121,62 @@ def test_hw_calibration_optimizer_rejects_unknown_mode():
         create_hw_calibration_optimizer(params, 1e-4, "unknown")
 
 
+def test_variation_aware_single_nominal_sample_matches_train_step():
+    model, state = _tiny_state()
+    inputs = np.ones((2, 1))
+    labels = np.array([0, 1])
+    integration_times = np.ones((2, 1))
+    rng = jax.random.PRNGKey(1)
+
+    regular_state, regular_loss = train_step(
+        state, rng, inputs, labels, integration_times, model, False
+    )
+    aware_state, aware_loss = variation_aware_train_step(
+        state,
+        [rng],
+        inputs,
+        labels,
+        integration_times,
+        model,
+        False,
+        [state.params],
+    )
+
+    assert float(aware_loss) == pytest.approx(float(regular_loss))
+    for expected, actual in zip(
+        jax.tree_util.tree_leaves(regular_state.params),
+        jax.tree_util.tree_leaves(aware_state.params),
+    ):
+        assert np.allclose(expected, actual)
+
+
+def test_variation_aware_step_does_not_replace_master_params_with_chip_params():
+    model, state = _tiny_state(learning_rate=0.0)
+    inputs = np.ones((2, 1))
+    labels = np.array([0, 1])
+    integration_times = np.ones((2, 1))
+    chip_params = jax.tree_util.tree_map(lambda value: value + 10.0, state.params)
+
+    updated_state, _ = variation_aware_train_step(
+        state,
+        [jax.random.PRNGKey(2)],
+        inputs,
+        labels,
+        integration_times,
+        model,
+        False,
+        [chip_params],
+    )
+
+    for original, updated, chip in zip(
+        jax.tree_util.tree_leaves(state.params),
+        jax.tree_util.tree_leaves(updated_state.params),
+        jax.tree_util.tree_leaves(chip_params),
+    ):
+        assert np.allclose(original, updated)
+        assert not np.allclose(updated, chip)
+
+
 def test_hw_calibration_gate_requires_flag_and_epochs():
     args = Args()
     args.hw_calibrate_readout = False
@@ -147,6 +230,25 @@ def test_hw_variation_aware_samples_and_seed_schedule():
     assert _hw_variation_aware_eval_seed(7, epoch=2, sample_index=1, eval_samples=3) == 10014
 
 
+def test_hw_variation_aware_selection_uses_fixed_held_out_configuration():
+    args = Args()
+    args.hw_variation_aware_sigma = 0.03
+    args.hw_variation_aware_sigma_schedule = "0.03,0.05,0.1"
+    args.hw_variation_aware_eval_samples = 4
+    args.hw_variation_aware_select_sigma = 0.05
+    args.hw_variation_aware_select_samples = None
+
+    assert _hw_variation_aware_select_sigma(args) == pytest.approx(0.05)
+    assert _hw_variation_aware_select_samples(args) == 4
+    assert _hw_variation_aware_select_seed(7, 0) == 20007
+    assert _hw_variation_aware_select_seed(7, 3) == 20010
+
+    args.hw_variation_aware_select_sigma = None
+    args.hw_variation_aware_select_samples = 2
+    assert _hw_variation_aware_select_sigma(args) == pytest.approx(0.1)
+    assert _hw_variation_aware_select_samples(args) == 2
+
+
 def test_hw_variation_aware_sigma_schedule_reuses_last_value():
     args = Args()
     args.hw_variation_aware_sigma = 0.05
@@ -197,5 +299,7 @@ def test_run_train_exposes_variation_aware_cli_flags():
     assert "--hw_variation_aware_sigma_schedule" in result.stdout
     assert "--hw_variation_aware_nominal_fraction" in result.stdout
     assert "--hw_variation_aware_select_metric" in result.stdout
+    assert "--hw_variation_aware_select_sigma" in result.stdout
+    assert "--hw_variation_aware_select_samples" in result.stdout
     assert "mean_std" in result.stdout
     assert "p10_acc" in result.stdout

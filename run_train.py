@@ -129,6 +129,10 @@ if __name__ == "__main__":
 						help="Number of varied projections used for each variation-aware calibration epoch.")
 	parser.add_argument("--hw_variation_aware_eval_samples", type=int, default=3,
 						help="Number of varied projections used to select each variation-aware checkpoint.")
+	parser.add_argument("--hw_variation_aware_select_sigma", type=float, default=None,
+						help="Fixed component-variation sigma used to select variation-aware checkpoints. Defaults to the final curriculum sigma.")
+	parser.add_argument("--hw_variation_aware_select_samples", type=int, default=None,
+						help="Number of fixed held-out hardware realizations used for variation-aware checkpoint selection. Defaults to --hw_variation_aware_eval_samples.")
 	parser.add_argument("--hw_variation_aware_nominal_fraction", type=float, default=0.0,
 						help="Fraction of variation-aware train samples kept at sigma=0 to preserve nominal accuracy.")
 	parser.add_argument("--hw_variation_aware_select_metric", type=str, default="mean_acc", choices=["mean_acc", "mean_std", "mean_std_strong", "min_acc", "p10_acc"],

@@ -46,6 +46,7 @@ for seed in 0 1 2 3 4; do
     hw_variation_aware_seed=$seed \
     hw_variation_aware_train_samples=8 \
     hw_variation_aware_eval_samples=8 \
+    hw_variation_aware_select_sigma=0.05 \
     hw_variation_aware_nominal_fraction=0.1 \
     hw_variation_aware_select_metric=mean_std_strong \
     params_out=${base}.msgpack \

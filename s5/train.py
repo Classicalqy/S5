@@ -17,6 +17,7 @@ from .train_helpers import (
     reset_optimizer,
     train_epoch,
     validate,
+    variation_aware_calibration_epoch,
 )
 from .dataloading import Datasets
 from .seq_model import BatchClassificationModel, RetrievalModel
@@ -93,6 +94,23 @@ def _hw_variation_aware_eval_samples(args):
     return max(1, int(getattr(args, "hw_variation_aware_eval_samples", 3)))
 
 
+def _hw_variation_aware_select_sigma(args):
+    value = getattr(args, "hw_variation_aware_select_sigma", None)
+    if value is not None:
+        value = float(value)
+        if value < 0.0:
+            raise ValueError("Variation-aware selection sigma must be non-negative.")
+        return value
+    return float(_hw_variation_aware_sigma_schedule(args)[-1])
+
+
+def _hw_variation_aware_select_samples(args):
+    value = getattr(args, "hw_variation_aware_select_samples", None)
+    if value is None:
+        return _hw_variation_aware_eval_samples(args)
+    return max(1, int(value))
+
+
 def _parse_hw_variation_aware_sigma_schedule(value):
     if value is None:
         return []
@@ -141,6 +159,11 @@ def _hw_variation_aware_train_seed(base_seed, epoch, sample_index, train_samples
 
 def _hw_variation_aware_eval_seed(base_seed, epoch, sample_index, eval_samples):
     return int(base_seed) + 10000 + int(epoch) * int(eval_samples) + int(sample_index)
+
+
+def _hw_variation_aware_select_seed(base_seed, sample_index):
+    """Return a held-out, epoch-invariant seed for checkpoint selection."""
+    return int(base_seed) + 20000 + int(sample_index)
 
 
 def _hw_variation_aware_score(val_accuracies, select_metric):
@@ -763,7 +786,8 @@ def train(args):
             aware_sigma_schedule = _hw_variation_aware_sigma_schedule(args)
             aware_seed = int(getattr(args, "hw_variation_aware_seed", 0))
             aware_train_samples = _hw_variation_aware_train_samples(args)
-            aware_eval_samples = _hw_variation_aware_eval_samples(args)
+            aware_select_sigma = _hw_variation_aware_select_sigma(args)
+            aware_select_samples = _hw_variation_aware_select_samples(args)
             aware_select_metric = getattr(args, "hw_variation_aware_select_metric", "mean_acc")
             aware_nominal_fraction = _hw_variation_aware_nominal_fraction(args)
             aware_nominal_samples = _hw_variation_aware_nominal_train_samples(
@@ -773,11 +797,12 @@ def train(args):
             nominal_config = _hw_projection_config(args, variation_sigma=0.0)
             print(
                 "[*] Starting variation-aware analog calibration with sigma_schedule={}, "
-                "train_samples={}, eval_samples={}, nominal_train_samples={}, select_metric={}...".format(
+                "train_samples={}, nominal_train_samples={}, select_sigma={}, select_samples={}, select_metric={}...".format(
                     ",".join("{:.6g}".format(sigma) for sigma in aware_sigma_schedule),
                     aware_train_samples,
-                    aware_eval_samples,
                     aware_nominal_samples,
+                    aware_select_sigma,
+                    aware_select_samples,
                     aware_select_metric,
                 )
             )
@@ -798,7 +823,7 @@ def train(args):
                 ),
             )
 
-            best_aware_params = state.params
+            best_aware_master_params = state.params
             best_aware_batch_stats = state.batch_stats if args.batchnorm and hasattr(state, "batch_stats") else None
             best_aware_loss, best_aware_acc = 100000000, -100000000.0
             best_aware_test_loss, best_aware_test_acc = 100000000, -100000000.0
@@ -806,71 +831,63 @@ def train(args):
 
             for aware_epoch in range(int(args.hw_variation_aware_epochs)):
                 aware_sigma = _hw_variation_aware_epoch_sigma(args, aware_epoch)
-                train_losses = []
+                train_configs = []
                 for sample_index in range(aware_train_samples):
                     sample_sigma = 0.0 if sample_index < aware_nominal_samples else aware_sigma
-                    variation_seed = _hw_variation_aware_train_seed(
-                        aware_seed,
-                        aware_epoch,
-                        sample_index,
-                        aware_train_samples,
-                    )
-                    varied_config = _hw_projection_config(
-                        args,
-                        variation_sigma=sample_sigma,
-                        variation_seed=variation_seed,
-                    )
-                    varied_params, projection_report = project_params_tree(
-                        params=state.params,
-                        ssm_param=args.ssm_param,
-                        sample_rate=getattr(args, "hw_sample_rate", 16000.0),
-                        projection_config=varied_config,
-                    )
-                    state = state.replace(params=varied_params)
-
-                    print(
-                        "[*] Starting HW Variation-Aware Epoch {} Sample {} (sigma={:.6g}, seed={})...".format(
-                            aware_epoch + 1,
-                            sample_index + 1,
-                            sample_sigma,
-                            variation_seed,
+                    train_configs.append(
+                        _hw_projection_config(
+                            args,
+                            variation_sigma=sample_sigma,
+                            variation_seed=_hw_variation_aware_train_seed(
+                                aware_seed,
+                                aware_epoch,
+                                sample_index,
+                                aware_train_samples,
+                            ),
                         )
                     )
-                    train_rng, skey = random.split(train_rng)
-                    state, sample_train_loss = calibration_epoch(
-                        state,
-                        skey,
-                        model_cls,
-                        trainloader,
-                        seq_len,
-                        in_dim,
-                        args.batchnorm,
-                    )
-                    train_losses.append(float(sample_train_loss))
 
-                    nominal_params, projection_report = project_params_tree(
-                        params=state.params,
-                        ssm_param=args.ssm_param,
-                        sample_rate=getattr(args, "hw_sample_rate", 16000.0),
-                        projection_config=nominal_config,
-                    )
-                    state = state.replace(params=nominal_params)
+                def varied_params_for_batch(master_params):
+                    return [
+                        project_params_tree(
+                            params=master_params,
+                            ssm_param=args.ssm_param,
+                            sample_rate=getattr(args, "hw_sample_rate", 16000.0),
+                            projection_config=config,
+                        )[0]
+                        for config in train_configs
+                    ]
 
-                aware_train_loss = float(np.mean(np.asarray(train_losses, dtype=np.float32)))
+                print(
+                    "[*] Starting HW Variation-Aware Epoch {} EOT calibration "
+                    "(train sigma={:.6g}, {} fixed realizations)...".format(
+                        aware_epoch + 1,
+                        aware_sigma,
+                        aware_train_samples,
+                    )
+                )
+                train_rng, skey = random.split(train_rng)
+                state, aware_train_loss = variation_aware_calibration_epoch(
+                    state,
+                    skey,
+                    model_cls,
+                    trainloader,
+                    seq_len,
+                    in_dim,
+                    args.batchnorm,
+                    varied_params_for_batch,
+                    aware_train_samples,
+                )
+                aware_train_loss = float(aware_train_loss)
                 val_losses = []
                 val_accs = []
                 test_losses = []
                 test_accs = []
-                for sample_index in range(aware_eval_samples):
-                    variation_seed = _hw_variation_aware_eval_seed(
-                        aware_seed,
-                        aware_epoch,
-                        sample_index,
-                        aware_eval_samples,
-                    )
+                for sample_index in range(aware_select_samples):
+                    variation_seed = _hw_variation_aware_select_seed(aware_seed, sample_index)
                     varied_config = _hw_projection_config(
                         args,
-                        variation_sigma=aware_sigma,
+                        variation_sigma=aware_select_sigma,
                         variation_seed=variation_seed,
                     )
                     eval_params, projection_report = project_params_tree(
@@ -882,10 +899,10 @@ def train(args):
                     eval_state = state.replace(params=eval_params)
                     if valloader is not None:
                         print(
-                            "[*] Running HW Variation-Aware Epoch {} Validation Sample {} (sigma={:.6g}, seed={})...".format(
+                            "[*] Running HW Variation-Aware Epoch {} Selection Validation Sample {} (sigma={:.6g}, seed={})...".format(
                                 aware_epoch + 1,
                                 sample_index + 1,
-                                aware_sigma,
+                                aware_select_sigma,
                                 variation_seed,
                             )
                         )
@@ -898,10 +915,10 @@ def train(args):
                             args.batchnorm,
                         )
                         print(
-                            "[*] Running HW Variation-Aware Epoch {} Test Sample {} (sigma={:.6g}, seed={})...".format(
+                            "[*] Running HW Variation-Aware Epoch {} Selection Test Sample {} (sigma={:.6g}, seed={})...".format(
                                 aware_epoch + 1,
                                 sample_index + 1,
-                                aware_sigma,
+                                aware_select_sigma,
                                 variation_seed,
                             )
                         )
@@ -915,10 +932,10 @@ def train(args):
                         )
                     else:
                         print(
-                            "[*] Running HW Variation-Aware Epoch {} Test Sample {} (sigma={:.6g}, seed={})...".format(
+                            "[*] Running HW Variation-Aware Epoch {} Selection Test Sample {} (sigma={:.6g}, seed={})...".format(
                                 aware_epoch + 1,
                                 sample_index + 1,
-                                aware_sigma,
+                                aware_select_sigma,
                                 variation_seed,
                             )
                         )
@@ -945,7 +962,8 @@ def train(args):
                 print(
                     f"\tTrain Loss: {aware_train_loss:.5f} -- Mean Var Val Loss: {aware_val_loss:.5f} --"
                     f" Mean Var Test Loss: {aware_test_loss:.5f} -- Mean Var Val Accuracy: {aware_val_acc:.4f}"
-                    f" Mean Var Test Accuracy: {aware_test_acc:.4f} -- Sigma: {aware_sigma:.6g}"
+                    f" Mean Var Test Accuracy: {aware_test_acc:.4f} -- Train Sigma: {aware_sigma:.6g}"
+                    f" -- Selection Sigma: {aware_select_sigma:.6g}"
                 )
 
                 if aware_val_acc > best_aware_acc:
@@ -954,7 +972,7 @@ def train(args):
                     best_aware_test_loss = aware_test_loss
                     best_aware_test_acc = aware_test_acc
                     best_aware_epoch = aware_epoch
-                    best_aware_params = state.params
+                    best_aware_master_params = state.params
                     if args.batchnorm and hasattr(state, "batch_stats"):
                         best_aware_batch_stats = state.batch_stats
 
@@ -965,10 +983,17 @@ def train(args):
                         "HW Variation-Aware Val Accuracy": aware_val_acc,
                         "HW Variation-Aware Test Loss": aware_test_loss,
                         "HW Variation-Aware Test Accuracy": aware_test_acc,
-                        "HW Variation-Aware Sigma": aware_sigma,
+                        "HW Variation-Aware Train Sigma": aware_sigma,
+                        "HW Variation-Aware Selection Sigma": aware_select_sigma,
                     }
                 )
 
+            best_aware_params, projection_report = project_params_tree(
+                params=best_aware_master_params,
+                ssm_param=args.ssm_param,
+                sample_rate=getattr(args, "hw_sample_rate", 16000.0),
+                projection_config=nominal_config,
+            )
             best_calibrated_params = best_aware_params
             best_calibrated_batch_stats = best_aware_batch_stats
             best_calibrated_loss = best_aware_loss
