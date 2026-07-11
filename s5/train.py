@@ -13,6 +13,7 @@ from .train_helpers import (
     linear_warmup,
     cosine_annealing,
     constant_lr,
+    physical_noise_cvar_calibration_epoch,
     reduce_lr_on_plateau,
     reset_optimizer,
     stack_variation_offsets,
@@ -790,16 +791,22 @@ def train(args):
             aware_select_sigma = _hw_variation_aware_select_sigma(args)
             aware_select_samples = _hw_variation_aware_select_samples(args)
             aware_select_metric = getattr(args, "hw_variation_aware_select_metric", "mean_acc")
+            aware_loss = getattr(args, "hw_variation_aware_loss", "projected_eot")
+            aware_consistency_weight = float(getattr(args, "hw_variation_aware_consistency_weight", 0.5))
+            aware_cvar_fraction = float(getattr(args, "hw_variation_aware_cvar_fraction", 0.5))
             aware_nominal_fraction = _hw_variation_aware_nominal_fraction(args)
             aware_nominal_samples = _hw_variation_aware_nominal_train_samples(
                 aware_train_samples,
                 aware_nominal_fraction,
             )
+            if aware_loss == "physical_noise_cvar" and args.batchnorm:
+                raise ValueError("physical_noise_cvar variation-aware training requires batchnorm=False.")
             nominal_config = _hw_projection_config(args, variation_sigma=0.0)
             print(
                 "[*] Starting variation-aware analog calibration with sigma_schedule={}, "
-                "train_samples={}, nominal_train_samples={}, select_sigma={}, select_samples={}, select_metric={}...".format(
+                "loss={}, train_samples={}, nominal_train_samples={}, select_sigma={}, select_samples={}, select_metric={}...".format(
                     ",".join("{:.6g}".format(sigma) for sigma in aware_sigma_schedule),
+                    aware_loss,
                     aware_train_samples,
                     aware_nominal_samples,
                     aware_select_sigma,
@@ -832,53 +839,81 @@ def train(args):
 
             for aware_epoch in range(int(args.hw_variation_aware_epochs)):
                 aware_sigma = _hw_variation_aware_epoch_sigma(args, aware_epoch)
-                train_configs = []
-                for sample_index in range(aware_train_samples):
-                    sample_sigma = 0.0 if sample_index < aware_nominal_samples else aware_sigma
-                    train_configs.append(
-                        _hw_projection_config(
-                            args,
-                            variation_sigma=sample_sigma,
-                            variation_seed=_hw_variation_aware_train_seed(
-                                aware_seed,
-                                aware_epoch,
-                                sample_index,
-                                aware_train_samples,
-                            ),
+                train_rng, skey = random.split(train_rng)
+                if aware_loss == "projected_eot":
+                    train_configs = []
+                    for sample_index in range(aware_train_samples):
+                        sample_sigma = 0.0 if sample_index < aware_nominal_samples else aware_sigma
+                        train_configs.append(
+                            _hw_projection_config(
+                                args,
+                                variation_sigma=sample_sigma,
+                                variation_seed=_hw_variation_aware_train_seed(
+                                    aware_seed,
+                                    aware_epoch,
+                                    sample_index,
+                                    aware_train_samples,
+                                ),
+                            )
+                        )
+
+                    varied_params = [
+                        project_params_tree(
+                            params=state.params,
+                            ssm_param=args.ssm_param,
+                            sample_rate=getattr(args, "hw_sample_rate", 16000.0),
+                            projection_config=config,
+                        )[0]
+                        for config in train_configs
+                    ]
+                    variation_offsets = stack_variation_offsets(state.params, varied_params)
+
+                    print(
+                        "[*] Starting HW Variation-Aware Epoch {} EOT calibration "
+                        "(train sigma={:.6g}, {} fixed realizations)...".format(
+                            aware_epoch + 1,
+                            aware_sigma,
+                            aware_train_samples,
                         )
                     )
-
-                varied_params = [
-                    project_params_tree(
-                        params=state.params,
-                        ssm_param=args.ssm_param,
-                        sample_rate=getattr(args, "hw_sample_rate", 16000.0),
-                        projection_config=config,
-                    )[0]
-                    for config in train_configs
-                ]
-                variation_offsets = stack_variation_offsets(state.params, varied_params)
-
-                print(
-                    "[*] Starting HW Variation-Aware Epoch {} EOT calibration "
-                    "(train sigma={:.6g}, {} fixed realizations)...".format(
-                        aware_epoch + 1,
-                        aware_sigma,
+                    state, aware_train_loss = variation_aware_calibration_epoch(
+                        state,
+                        skey,
+                        model_cls,
+                        trainloader,
+                        seq_len,
+                        in_dim,
+                        args.batchnorm,
+                        variation_offsets,
                         aware_train_samples,
                     )
-                )
-                train_rng, skey = random.split(train_rng)
-                state, aware_train_loss = variation_aware_calibration_epoch(
-                    state,
-                    skey,
-                    model_cls,
-                    trainloader,
-                    seq_len,
-                    in_dim,
-                    args.batchnorm,
-                    variation_offsets,
-                    aware_train_samples,
-                )
+                elif aware_loss == "physical_noise_cvar":
+                    print(
+                        "[*] Starting HW Variation-Aware Epoch {} physical-noise CVaR calibration "
+                        "(train sigma={:.6g}, samples={}, consistency_weight={:.6g}, cvar_fraction={:.6g})...".format(
+                            aware_epoch + 1,
+                            aware_sigma,
+                            aware_train_samples,
+                            aware_consistency_weight,
+                            aware_cvar_fraction,
+                        )
+                    )
+                    state, aware_train_loss = physical_noise_cvar_calibration_epoch(
+                        state,
+                        skey,
+                        model_cls,
+                        trainloader,
+                        seq_len,
+                        in_dim,
+                        args.batchnorm,
+                        aware_sigma,
+                        args.ssm_param,
+                        aware_train_samples,
+                        aware_consistency_weight,
+                        aware_cvar_fraction,
+                    )
+                else:
+                    raise ValueError("--hw_variation_aware_loss must be projected_eot or physical_noise_cvar.")
                 aware_train_loss = float(aware_train_loss)
                 val_losses = []
                 val_accs = []

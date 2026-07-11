@@ -49,6 +49,9 @@ for seed in 0 1 2 3 4; do
     hw_variation_aware_select_sigma=0.05 \
     hw_variation_aware_nominal_fraction=0.1 \
     hw_variation_aware_select_metric=mean_std_strong \
+    hw_variation_aware_loss=physical_noise_cvar \
+    hw_variation_aware_consistency_weight=0.5 \
+    hw_variation_aware_cvar_fraction=0.5 \
     params_out=${base}.msgpack \
     hw_calibrated_params_out=${base}_calibrated.msgpack \
     hw_variation_aware_params_out=${base}_variation_aware.msgpack

@@ -1,4 +1,5 @@
 from functools import partial
+import math
 import jax
 import jax.numpy as np
 from jax.nn import one_hot
@@ -6,6 +7,8 @@ from tqdm import tqdm
 from flax.training import train_state
 import optax
 from typing import Any, Tuple
+
+from .ssm_parameterizations import HARDWARE_FRIENDLY_PARAMS, POSITIVE_EPS
 
 
 SSM_PARAMETER_NAMES = [
@@ -16,6 +19,8 @@ SSM_WITH_C_PARAMETER_NAMES = SSM_PARAMETER_NAMES + ["C", "C1", "C2", "D"]
 ANALOG_CALIBRATION_SSM_PARAMETER_NAMES = {
     "B", "C", "raw_alpha", "omega", "raw_q", "log_step",
 }
+PHYSICAL_NOISE_DIRECT_PARAMETER_NAMES = {"B", "C", "omega"}
+PHYSICAL_NOISE_POSITIVE_PARAMETER_NAMES = {"raw_alpha", "raw_q"}
 
 
 # LR schedulers
@@ -113,6 +118,51 @@ def maybe_unfreeze(tree):
     versions may already return ordinary dicts from model.init().
     """
     return tree.unfreeze() if hasattr(tree, "unfreeze") else tree
+
+
+def positive_to_raw(value):
+    value = np.maximum(value - POSITIVE_EPS, np.finfo(np.float32).tiny)
+    return np.where(value > 20.0, value, np.log(np.expm1(value)))
+
+
+def signed_multiplicative_noise(value, sigma, rng):
+    if float(sigma) <= 0.0:
+        return value
+    return value * (1.0 + float(sigma) * jax.random.normal(rng, value.shape, dtype=value.dtype))
+
+
+def _positive_multiplicative_noise(raw_value, sigma, rng):
+    physical_value = jax.nn.softplus(raw_value) + POSITIVE_EPS
+    noisy_value = signed_multiplicative_noise(physical_value, sigma, rng)
+    noisy_value = np.maximum(noisy_value, POSITIVE_EPS + np.finfo(noisy_value.dtype).tiny)
+    return positive_to_raw(noisy_value).astype(raw_value.dtype)
+
+
+def _stable_path_hash(path):
+    value = 0
+    for part in path:
+        for char in part:
+            value = (value * 131 + ord(char)) & 0x7FFFFFFF
+        value = (value * 131 + 17) & 0x7FFFFFFF
+    return value
+
+
+def perturb_physical_params(params, rng, sigma, ssm_param):
+    """Apply differentiable physical-parameter noise to hardware-friendly SSM leaves."""
+    if ssm_param not in HARDWARE_FRIENDLY_PARAMS:
+        raise ValueError("physical-noise training requires a hardware-friendly ssm_param.")
+    if float(sigma) <= 0.0:
+        return params
+
+    def perturb(path, key, value):
+        if key not in PHYSICAL_NOISE_DIRECT_PARAMETER_NAMES | PHYSICAL_NOISE_POSITIVE_PARAMETER_NAMES:
+            return value
+        leaf_rng = jax.random.fold_in(rng, _stable_path_hash(path))
+        if key in PHYSICAL_NOISE_DIRECT_PARAMETER_NAMES:
+            return signed_multiplicative_noise(value, sigma, leaf_rng).astype(value.dtype)
+        return _positive_multiplicative_noise(value, sigma, leaf_rng)
+
+    return map_nested_with_path_fn(perturb)(params)
 
 
 def decoder_only_param_labels(params):
@@ -506,6 +556,149 @@ def variation_aware_calibration_epoch(
             model,
             batchnorm,
             variation_offsets,
+        )
+        batch_losses.append(loss)
+
+    return state, np.mean(np.asarray(batch_losses))
+
+
+def cvar_top_mean(losses, cvar_fraction):
+    losses = np.asarray(losses)
+    num_losses = int(losses.shape[0])
+    fraction = min(1.0, max(0.0, float(cvar_fraction)))
+    k = max(1, min(num_losses, int(math.ceil(num_losses * fraction))))
+    top_losses, _ = jax.lax.top_k(losses, k)
+    return np.mean(top_losses)
+
+
+def physical_noise_cvar_train_step(
+    state,
+    rngs,
+    batch_inputs,
+    batch_labels,
+    batch_integration_timesteps,
+    model,
+    batchnorm,
+    sigma,
+    ssm_param,
+    consistency_weight,
+    cvar_fraction,
+):
+    if batchnorm:
+        raise ValueError("physical_noise_cvar variation-aware training requires batchnorm=False.")
+    if float(sigma) <= 0.0:
+        rng = np.asarray(rngs)[0]
+        return train_step(
+            state,
+            rng,
+            batch_inputs,
+            batch_labels,
+            batch_integration_timesteps,
+            model,
+            batchnorm,
+        )
+    return _physical_noise_cvar_train_step(
+        state,
+        rngs,
+        batch_inputs,
+        batch_labels,
+        batch_integration_timesteps,
+        model,
+        batchnorm,
+        float(sigma),
+        ssm_param,
+        float(consistency_weight),
+        float(cvar_fraction),
+    )
+
+
+@partial(jax.jit, static_argnums=(5, 6, 7, 8, 9, 10))
+def _physical_noise_cvar_train_step(
+    state,
+    rngs,
+    batch_inputs,
+    batch_labels,
+    batch_integration_timesteps,
+    model,
+    batchnorm,
+    sigma,
+    ssm_param,
+    consistency_weight,
+    cvar_fraction,
+):
+    rngs = np.asarray(rngs)
+
+    def apply_params(params, rng):
+        logits, _mod_vars = model.apply(
+            {"params": params},
+            batch_inputs,
+            batch_integration_timesteps,
+            rngs={"dropout": rng},
+            mutable=["intermediates"],
+        )
+        return logits
+
+    def loss_fn(params):
+        nominal_logits = apply_params(params, rngs[0])
+        nominal_losses = cross_entropy_loss(nominal_logits, batch_labels)
+        nominal_ce = np.mean(nominal_losses)
+        teacher_logits = jax.lax.stop_gradient(nominal_logits)
+        teacher_probs = jax.lax.stop_gradient(np.exp(nominal_logits))
+
+        def noisy_loss(noise_rng):
+            noisy_params = perturb_physical_params(params, noise_rng, sigma, ssm_param)
+            noisy_logits = apply_params(noisy_params, noise_rng)
+            noisy_ce = np.mean(cross_entropy_loss(noisy_logits, batch_labels))
+            kl = np.mean(np.sum(teacher_probs * (teacher_logits - noisy_logits), axis=-1))
+            return noisy_ce, kl
+
+        noisy_losses, consistency_losses = jax.vmap(noisy_loss)(rngs)
+        noisy_cvar_ce = cvar_top_mean(noisy_losses, cvar_fraction)
+        consistency_kl = np.mean(consistency_losses)
+        loss = 0.5 * nominal_ce + 0.5 * noisy_cvar_ce + consistency_weight * consistency_kl
+        return loss, (nominal_ce, noisy_cvar_ce, consistency_kl)
+
+    (loss, _metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    state = state.apply_gradients(grads=grads)
+    return state, loss
+
+
+def physical_noise_cvar_calibration_epoch(
+    state,
+    rng,
+    model,
+    trainloader,
+    seq_len,
+    in_dim,
+    batchnorm,
+    sigma,
+    ssm_param,
+    num_samples,
+    consistency_weight,
+    cvar_fraction,
+):
+    if batchnorm:
+        raise ValueError("physical_noise_cvar variation-aware training requires batchnorm=False.")
+    model = model(training=True)
+    batch_losses = []
+    num_samples = max(1, int(num_samples))
+
+    for batch in tqdm(trainloader):
+        inputs, labels, integration_times = prep_batch(batch, seq_len, in_dim)
+        rng, sample_rng = jax.random.split(rng)
+        sample_rngs = jax.random.split(sample_rng, num_samples)
+        state, loss = physical_noise_cvar_train_step(
+            state,
+            sample_rngs,
+            inputs,
+            labels,
+            integration_times,
+            model,
+            batchnorm,
+            sigma,
+            ssm_param,
+            consistency_weight,
+            cvar_fraction,
         )
         batch_losses.append(loss)
 

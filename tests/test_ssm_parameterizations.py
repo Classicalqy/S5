@@ -9,6 +9,7 @@ from s5.ssm_parameterizations import (
     init_RealValuedSSM,
     summarize_state_space,
 )
+from s5.train_helpers import perturb_physical_params
 
 
 def _args(ssm_param):
@@ -83,6 +84,37 @@ def _run_hardware_smoke(ssm_param):
 def test_hardware_parameterizations_are_stable_real_no_d_and_differentiable():
     for ssm_param in HARDWARE_FRIENDLY_PARAMS:
         _run_hardware_smoke(ssm_param)
+
+
+def test_physical_noise_perturbed_hardware_params_are_differentiable():
+    seq_len, input_dim, state_dim = 16, 4, 8
+    x = np.ones((seq_len, input_dim))
+    rng = jax.random.PRNGKey(11)
+
+    for ssm_param in HARDWARE_FRIENDLY_PARAMS:
+        ssm_cls = init_RealValuedSSM(
+            H=input_dim,
+            P=state_dim,
+            ssm_param=ssm_param,
+            discretization="zoh",
+            dt_min=0.001,
+            dt_max=0.1,
+        )
+        model = ssm_cls()
+        variables = model.init(rng, x)
+
+        def loss_fn(params):
+            noisy_params = perturb_physical_params(
+                params,
+                jax.random.PRNGKey(12),
+                0.05,
+                ssm_param,
+            )
+            out = model.apply({"params": noisy_params}, x)
+            return np.sum(out ** 2)
+
+        grads = jax.grad(loss_fn)(variables["params"])
+        assert _finite_tree(grads)
 
 
 def test_original_no_d_omits_feedthrough_and_matches_output_shape():

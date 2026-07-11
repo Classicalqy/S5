@@ -28,7 +28,10 @@ from s5.train import (
 from s5.train_helpers import (
     analog_calibration_param_labels,
     create_hw_calibration_optimizer,
+    cvar_top_mean,
     decoder_only_param_labels,
+    perturb_physical_params,
+    physical_noise_cvar_train_step,
     stack_variation_offsets,
     train_step,
     variation_aware_train_step,
@@ -207,6 +210,76 @@ def test_variation_aware_step_does_not_replace_master_params_with_chip_params():
         assert not np.allclose(updated, chip)
 
 
+def test_physical_noise_cvar_zero_sigma_matches_train_step():
+    model, state = _tiny_state()
+    inputs = np.ones((2, 1))
+    labels = np.array([0, 1])
+    integration_times = np.ones((2, 1))
+    rng = jax.random.PRNGKey(5)
+
+    regular_state, regular_loss = train_step(
+        state, rng, inputs, labels, integration_times, model, False
+    )
+    aware_state, aware_loss = physical_noise_cvar_train_step(
+        state,
+        jax.random.split(rng, 3),
+        inputs,
+        labels,
+        integration_times,
+        model,
+        False,
+        0.0,
+        "resonant_2x2",
+        0.5,
+        0.5,
+    )
+
+    assert float(aware_loss) == pytest.approx(float(regular_loss))
+    for expected, actual in zip(
+        jax.tree_util.tree_leaves(regular_state.params),
+        jax.tree_util.tree_leaves(aware_state.params),
+    ):
+        assert np.allclose(expected, actual)
+
+
+def test_cvar_top_mean_uses_highest_fraction():
+    losses = np.array([1.0, 4.0, 2.0, 8.0])
+
+    assert float(cvar_top_mean(losses, 0.5)) == pytest.approx(6.0)
+    assert float(cvar_top_mean(losses, 0.25)) == pytest.approx(8.0)
+    assert float(cvar_top_mean(losses, 1.0)) == pytest.approx(3.75)
+
+
+def test_perturb_physical_params_preserves_tree_shape_and_finiteness():
+    params = {
+        "encoder": {
+            "layers_0": {
+                "seq": {
+                    "B": np.ones((2, 2)),
+                    "C": np.ones((2, 2)),
+                    "raw_alpha": np.zeros((1,)),
+                    "omega": np.ones((1,)),
+                    "raw_q": np.zeros((1,)),
+                    "log_step": np.ones((1, 1)),
+                },
+            },
+        },
+        "decoder": {"kernel": np.ones((2, 3))},
+    }
+
+    perturbed = perturb_physical_params(
+        params,
+        jax.random.PRNGKey(7),
+        0.05,
+        "energy_shaped_2x2",
+    )
+
+    assert jax.tree_util.tree_structure(perturbed) == jax.tree_util.tree_structure(params)
+    assert all(bool(np.all(np.isfinite(leaf))) for leaf in jax.tree_util.tree_leaves(perturbed))
+    assert np.allclose(perturbed["decoder"]["kernel"], params["decoder"]["kernel"])
+    assert not np.allclose(perturbed["encoder"]["layers_0"]["seq"]["B"], params["encoder"]["layers_0"]["seq"]["B"])
+
+
 def test_hw_calibration_gate_requires_flag_and_epochs():
     args = Args()
     args.hw_calibrate_readout = False
@@ -331,5 +404,8 @@ def test_run_train_exposes_variation_aware_cli_flags():
     assert "--hw_variation_aware_select_metric" in result.stdout
     assert "--hw_variation_aware_select_sigma" in result.stdout
     assert "--hw_variation_aware_select_samples" in result.stdout
+    assert "--hw_variation_aware_loss" in result.stdout
+    assert "--hw_variation_aware_consistency_weight" in result.stdout
+    assert "--hw_variation_aware_cvar_fraction" in result.stdout
     assert "mean_std" in result.stdout
     assert "p10_acc" in result.stdout
