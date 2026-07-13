@@ -41,8 +41,8 @@ for seed in 0 1 2 3 4; do
     hw_c_max=1e-9 \
     hw_variation_sigma=0.0 \
     hw_variation_aware_epochs=8 \
-    hw_variation_aware_sigma=0.12 \
-    hw_variation_aware_sigma_schedule=0.03,0.05,0.05,0.075,0.075,0.10,0.10,0.10 \
+    hw_variation_aware_sigma=0.075 \
+    hw_variation_aware_sigma_schedule=0.03,0.05,0.05,0.075,0.075,0.075,0.075,0.075 \
     hw_variation_aware_seed=$seed \
     hw_variation_aware_train_samples=8 \
     hw_variation_aware_eval_samples=8 \
