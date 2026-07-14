@@ -500,6 +500,54 @@ def train_epoch(state, rng, model, trainloader, seq_len, in_dim, batchnorm, lr_p
     return state, np.mean(np.array(batch_losses)), step
 
 
+def physical_noise_cvar_train_epoch(
+    state,
+    rng,
+    model,
+    trainloader,
+    seq_len,
+    in_dim,
+    batchnorm,
+    lr_params,
+    sigma,
+    ssm_param,
+    num_samples,
+    consistency_weight,
+    cvar_fraction,
+):
+    """Run one normal-training epoch with differentiable physical noise."""
+    if batchnorm:
+        raise ValueError("physical-noise training requires batchnorm=False.")
+    model = model(training=True)
+    batch_losses = []
+    num_samples = max(1, int(num_samples))
+
+    decay_function, ssm_lr, lr, step, end_step, opt_config, lr_min = lr_params
+
+    for batch in tqdm(trainloader):
+        inputs, labels, integration_times = prep_batch(batch, seq_len, in_dim)
+        rng, sample_rng = jax.random.split(rng)
+        sample_rngs = jax.random.split(sample_rng, num_samples)
+        state, loss = physical_noise_cvar_train_step(
+            state,
+            sample_rngs,
+            inputs,
+            labels,
+            integration_times,
+            model,
+            batchnorm,
+            sigma,
+            ssm_param,
+            consistency_weight,
+            cvar_fraction,
+        )
+        batch_losses.append(loss)
+        lr_params = (decay_function, ssm_lr, lr, step, end_step, opt_config, lr_min)
+        state, step = update_learning_rate_per_step(lr_params, state)
+
+    return state, np.mean(np.asarray(batch_losses)), step
+
+
 def calibration_epoch(state, rng, model, trainloader, seq_len, in_dim, batchnorm):
     """Run one fixed-LR calibration epoch without touching scheduler state."""
     model = model(training=True)

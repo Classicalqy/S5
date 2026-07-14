@@ -14,6 +14,7 @@ from .train_helpers import (
     cosine_annealing,
     constant_lr,
     physical_noise_cvar_calibration_epoch,
+    physical_noise_cvar_train_epoch,
     reduce_lr_on_plateau,
     reset_optimizer,
     stack_variation_offsets,
@@ -140,6 +141,28 @@ def _hw_variation_aware_sigma_schedule(args):
 def _hw_variation_aware_epoch_sigma(args, epoch):
     schedule = _hw_variation_aware_sigma_schedule(args)
     return float(schedule[min(int(epoch), len(schedule) - 1)])
+
+
+def _hw_train_noise_sigma_schedule(args):
+    schedule = _parse_hw_variation_aware_sigma_schedule(
+        getattr(args, "hw_train_noise_sigma_schedule", None)
+    )
+    if schedule:
+        return schedule
+    return [float(getattr(args, "hw_train_noise_sigma", 0.0))]
+
+
+def _hw_train_noise_epoch_sigma(args, epoch):
+    schedule = _hw_train_noise_sigma_schedule(args)
+    return float(schedule[min(int(epoch), len(schedule) - 1)])
+
+
+def _hw_train_noise_enabled(args):
+    return any(sigma > 0.0 for sigma in _hw_train_noise_sigma_schedule(args))
+
+
+def _hw_train_noise_samples(args):
+    return max(1, int(getattr(args, "hw_train_noise_samples", 4)))
 
 
 def _hw_variation_aware_nominal_fraction(args):
@@ -407,6 +430,25 @@ def train(args):
     best_params = state.params
     best_batch_stats = state.batch_stats if args.batchnorm and hasattr(state, "batch_stats") else None
     steps_per_epoch = int(train_size/args.bsz)
+    train_noise_enabled = _hw_train_noise_enabled(args)
+    train_noise_sigma_schedule = _hw_train_noise_sigma_schedule(args)
+    train_noise_samples = _hw_train_noise_samples(args)
+    train_noise_consistency_weight = float(getattr(args, "hw_train_noise_consistency_weight", 0.5))
+    train_noise_cvar_fraction = float(getattr(args, "hw_train_noise_cvar_fraction", 0.5))
+    if train_noise_enabled:
+        if args.batchnorm:
+            raise ValueError("physical-noise normal training requires batchnorm=False.")
+        if not is_hardware_friendly(args.ssm_param):
+            raise ValueError("physical-noise normal training requires a hardware-friendly ssm_param.")
+        print(
+            "[*] Enabled differentiable physical-noise normal training with sigma_schedule={}, "
+            "samples={}, consistency_weight={:.6g}, cvar_fraction={:.6g}.".format(
+                ",".join("{:.6g}".format(sigma) for sigma in train_noise_sigma_schedule),
+                train_noise_samples,
+                train_noise_consistency_weight,
+                train_noise_cvar_fraction,
+            )
+        )
     for epoch in range(args.epochs):
         print(f"[*] Starting Training Epoch {epoch + 1}...")
 
@@ -430,14 +472,37 @@ def train(args):
         lr_params = (decay_function, ssm_lr, lr, step, end_step, args.opt_config, args.lr_min)
 
         train_rng, skey = random.split(train_rng)
-        state, train_loss, step = train_epoch(state,
-                                              skey,
-                                              model_cls,
-                                              trainloader,
-                                              seq_len,
-                                              in_dim,
-                                              args.batchnorm,
-                                              lr_params)
+        train_noise_sigma = _hw_train_noise_epoch_sigma(args, epoch)
+        if train_noise_enabled:
+            print(
+                "[*] Training Epoch {} physical-noise sigma={:.6g}.".format(
+                    epoch + 1, train_noise_sigma
+                )
+            )
+            state, train_loss, step = physical_noise_cvar_train_epoch(
+                state,
+                skey,
+                model_cls,
+                trainloader,
+                seq_len,
+                in_dim,
+                args.batchnorm,
+                lr_params,
+                train_noise_sigma,
+                args.ssm_param,
+                train_noise_samples,
+                train_noise_consistency_weight,
+                train_noise_cvar_fraction,
+            )
+        else:
+            state, train_loss, step = train_epoch(state,
+                                                  skey,
+                                                  model_cls,
+                                                  trainloader,
+                                                  seq_len,
+                                                  in_dim,
+                                                  args.batchnorm,
+                                                  lr_params)
 
         if valloader is not None:
             print(f"[*] Running Epoch {epoch + 1} Validation...")

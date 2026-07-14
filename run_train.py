@@ -143,6 +143,16 @@ if __name__ == "__main__":
 						help="KL consistency weight for physical-noise CVaR variation-aware training.")
 	parser.add_argument("--hw_variation_aware_cvar_fraction", type=float, default=0.5,
 						help="Fraction of highest noisy losses averaged by physical-noise CVaR training.")
+	parser.add_argument("--hw_train_noise_sigma", type=float, default=0.0,
+						help="Differentiable physical-noise sigma used during normal training.")
+	parser.add_argument("--hw_train_noise_sigma_schedule", type=str, default=None,
+						help="Comma- or space-separated per-epoch physical-noise sigma curriculum for normal training. Reuses the last value after the schedule ends.")
+	parser.add_argument("--hw_train_noise_samples", type=int, default=4,
+						help="Number of differentiable physical-noise samples used per normal-training batch.")
+	parser.add_argument("--hw_train_noise_consistency_weight", type=float, default=0.5,
+						help="KL consistency weight for differentiable physical-noise normal training.")
+	parser.add_argument("--hw_train_noise_cvar_fraction", type=float, default=0.5,
+						help="Fraction of highest noisy losses averaged during differentiable physical-noise normal training.")
 	parser.add_argument("--hw_calibrated_params_out", type=str, default=None,
 						help="Path for best hardware-calibrated params; defaults beside --params_out.")
 	parser.add_argument("--hw_variation_aware_params_out", type=str, default=None,

@@ -22,6 +22,10 @@ from s5.train import (
     _hw_variation_aware_select_seed,
     _hw_variation_aware_select_sigma,
     _hw_variation_aware_sigma_schedule,
+    _hw_train_noise_epoch_sigma,
+    _hw_train_noise_enabled,
+    _hw_train_noise_samples,
+    _hw_train_noise_sigma_schedule,
     _hw_variation_aware_train_seed,
     _hw_variation_aware_train_samples,
 )
@@ -365,6 +369,24 @@ def test_hw_variation_aware_sigma_schedule_reuses_last_value():
     assert _hw_variation_aware_epoch_sigma(args, 4) == pytest.approx(0.1)
 
 
+def test_hw_train_noise_sigma_schedule_reuses_last_value():
+    args = Args()
+    args.hw_train_noise_sigma = 0.0
+    args.hw_train_noise_sigma_schedule = None
+    args.hw_train_noise_samples = 0
+    assert _hw_train_noise_sigma_schedule(args) == [0.0]
+    assert not _hw_train_noise_enabled(args)
+    assert _hw_train_noise_samples(args) == 1
+
+    args.hw_train_noise_sigma_schedule = "0,0.01,0.05"
+    args.hw_train_noise_samples = 4
+    assert _hw_train_noise_sigma_schedule(args) == [0.0, 0.01, 0.05]
+    assert _hw_train_noise_epoch_sigma(args, 0) == pytest.approx(0.0)
+    assert _hw_train_noise_epoch_sigma(args, 5) == pytest.approx(0.05)
+    assert _hw_train_noise_enabled(args)
+    assert _hw_train_noise_samples(args) == 4
+
+
 def test_hw_variation_aware_nominal_mix_clamps_and_counts_samples():
     args = Args()
     assert _hw_variation_aware_nominal_fraction(args) == 0.0
@@ -407,5 +429,10 @@ def test_run_train_exposes_variation_aware_cli_flags():
     assert "--hw_variation_aware_loss" in result.stdout
     assert "--hw_variation_aware_consistency_weight" in result.stdout
     assert "--hw_variation_aware_cvar_fraction" in result.stdout
+    assert "--hw_train_noise_sigma" in result.stdout
+    assert "--hw_train_noise_sigma_schedule" in result.stdout
+    assert "--hw_train_noise_samples" in result.stdout
+    assert "--hw_train_noise_consistency_weight" in result.stdout
+    assert "--hw_train_noise_cvar_fraction" in result.stdout
     assert "mean_std" in result.stdout
     assert "p10_acc" in result.stdout
