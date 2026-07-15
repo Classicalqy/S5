@@ -52,9 +52,9 @@ for seed in 0 1 2 3 4; do
     hw_variation_aware_loss=physical_noise_cvar \
     hw_variation_aware_consistency_weight=0.5 \
     hw_variation_aware_cvar_fraction=0.5 \
-    hw_train_noise_sigma=0.05 \
-    hw_train_noise_sigma_schedule=0,0,0,0,0,0.01,0.01,0.02,0.02,0.03,0.03,0.04,0.04,0.05,0.05,0.05,0.05,0.05,0.05,0.05 \
-    hw_train_noise_samples=4 \
+    hw_train_noise_sigma=0.075 \
+    hw_train_noise_sigma_schedule=0,0,0,0,0,0.01,0.01,0.02,0.02,0.03,0.03,0.04,0.04,0.05,0.05,0.075,0.075,0.075,0.075,0.075 \
+    hw_train_noise_samples=8 \
     hw_train_noise_consistency_weight=0.5 \
     hw_train_noise_cvar_fraction=0.5 \
     params_out=${base}.msgpack \
