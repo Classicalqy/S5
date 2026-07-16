@@ -246,6 +246,34 @@ def test_physical_noise_cvar_zero_sigma_matches_train_step():
         assert np.allclose(expected, actual)
 
 
+def test_physical_noise_cvar_mesa_consistency_is_finite():
+    model, state = _tiny_state()
+    inputs = np.ones((2, 1))
+    labels = np.array([0, 1])
+    integration_times = np.ones((2, 1))
+    rng = jax.random.PRNGKey(6)
+    ema_params = jax.tree_util.tree_map(lambda value: value + 0.01, state.params)
+
+    updated_state, loss = physical_noise_cvar_train_step(
+        state,
+        jax.random.split(rng, 3),
+        inputs,
+        labels,
+        integration_times,
+        model,
+        False,
+        0.0,
+        "resonant_2x2",
+        0.5,
+        0.5,
+        ema_params=ema_params,
+        mesa_weight=0.1,
+    )
+
+    assert np.isfinite(loss)
+    assert all(np.all(np.isfinite(leaf)) for leaf in jax.tree_util.tree_leaves(updated_state.params))
+
+
 def test_cvar_top_mean_uses_highest_fraction():
     losses = np.array([1.0, 4.0, 2.0, 8.0])
 
@@ -434,5 +462,8 @@ def test_run_train_exposes_variation_aware_cli_flags():
     assert "--hw_train_noise_samples" in result.stdout
     assert "--hw_train_noise_consistency_weight" in result.stdout
     assert "--hw_train_noise_cvar_fraction" in result.stdout
+    assert "--hw_train_noise_mesa_weight" in result.stdout
+    assert "--hw_train_noise_mesa_beta" in result.stdout
+    assert "--hw_train_noise_mesa_start_epoch" in result.stdout
     assert "mean_std" in result.stdout
     assert "p10_acc" in result.stdout

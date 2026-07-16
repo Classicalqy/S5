@@ -153,6 +153,12 @@ if __name__ == "__main__":
 						help="KL consistency weight for differentiable physical-noise normal training.")
 	parser.add_argument("--hw_train_noise_cvar_fraction", type=float, default=0.5,
 						help="Fraction of highest noisy losses averaged during differentiable physical-noise normal training.")
+	parser.add_argument("--hw_train_noise_mesa_weight", type=float, default=0.0,
+						help="EMA-teacher MESA consistency weight for physical-noise normal training.")
+	parser.add_argument("--hw_train_noise_mesa_beta", type=float, default=0.999,
+						help="EMA decay for MESA consistency during physical-noise normal training.")
+	parser.add_argument("--hw_train_noise_mesa_start_epoch", type=int, default=5,
+						help="First zero-based epoch index that enables MESA consistency during physical-noise normal training.")
 	parser.add_argument("--hw_calibrated_params_out", type=str, default=None,
 						help="Path for best hardware-calibrated params; defaults beside --params_out.")
 	parser.add_argument("--hw_variation_aware_params_out", type=str, default=None,

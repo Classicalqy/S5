@@ -435,6 +435,10 @@ def train(args):
     train_noise_samples = _hw_train_noise_samples(args)
     train_noise_consistency_weight = float(getattr(args, "hw_train_noise_consistency_weight", 0.5))
     train_noise_cvar_fraction = float(getattr(args, "hw_train_noise_cvar_fraction", 0.5))
+    train_noise_mesa_weight = max(0.0, float(getattr(args, "hw_train_noise_mesa_weight", 0.0)))
+    train_noise_mesa_beta = float(getattr(args, "hw_train_noise_mesa_beta", 0.999))
+    train_noise_mesa_start_epoch = max(0, int(getattr(args, "hw_train_noise_mesa_start_epoch", 5)))
+    train_noise_ema_params = state.params if train_noise_enabled and train_noise_mesa_weight > 0.0 else None
     if train_noise_enabled:
         if args.batchnorm:
             raise ValueError("physical-noise normal training requires batchnorm=False.")
@@ -442,11 +446,15 @@ def train(args):
             raise ValueError("physical-noise normal training requires a hardware-friendly ssm_param.")
         print(
             "[*] Enabled differentiable physical-noise normal training with sigma_schedule={}, "
-            "samples={}, consistency_weight={:.6g}, cvar_fraction={:.6g}.".format(
+            "samples={}, consistency_weight={:.6g}, cvar_fraction={:.6g}, "
+            "mesa_weight={:.6g}, mesa_beta={:.6g}, mesa_start_epoch={}.".format(
                 ",".join("{:.6g}".format(sigma) for sigma in train_noise_sigma_schedule),
                 train_noise_samples,
                 train_noise_consistency_weight,
                 train_noise_cvar_fraction,
+                train_noise_mesa_weight,
+                train_noise_mesa_beta,
+                train_noise_mesa_start_epoch,
             )
         )
     for epoch in range(args.epochs):
@@ -474,12 +482,19 @@ def train(args):
         train_rng, skey = random.split(train_rng)
         train_noise_sigma = _hw_train_noise_epoch_sigma(args, epoch)
         if train_noise_enabled:
+            current_mesa_weight = (
+                train_noise_mesa_weight
+                if epoch >= train_noise_mesa_start_epoch
+                else 0.0
+            )
             print(
-                "[*] Training Epoch {} physical-noise sigma={:.6g}.".format(
-                    epoch + 1, train_noise_sigma
+                "[*] Training Epoch {} physical-noise sigma={:.6g}, mesa_weight={:.6g}.".format(
+                    epoch + 1,
+                    train_noise_sigma,
+                    current_mesa_weight,
                 )
             )
-            state, train_loss, step = physical_noise_cvar_train_epoch(
+            state, train_loss, step, train_noise_ema_params = physical_noise_cvar_train_epoch(
                 state,
                 skey,
                 model_cls,
@@ -493,6 +508,9 @@ def train(args):
                 train_noise_samples,
                 train_noise_consistency_weight,
                 train_noise_cvar_fraction,
+                ema_params=train_noise_ema_params,
+                mesa_weight=current_mesa_weight,
+                mesa_beta=train_noise_mesa_beta,
             )
         else:
             state, train_loss, step = train_epoch(state,
