@@ -514,9 +514,6 @@ def physical_noise_cvar_train_epoch(
     num_samples,
     consistency_weight,
     cvar_fraction,
-    ema_params=None,
-    mesa_weight=0.0,
-    mesa_beta=0.999,
 ):
     """Run one normal-training epoch with differentiable physical noise."""
     if batchnorm:
@@ -543,16 +540,12 @@ def physical_noise_cvar_train_epoch(
             ssm_param,
             consistency_weight,
             cvar_fraction,
-            ema_params=ema_params,
-            mesa_weight=mesa_weight,
         )
         batch_losses.append(loss)
         lr_params = (decay_function, ssm_lr, lr, step, end_step, opt_config, lr_min)
         state, step = update_learning_rate_per_step(lr_params, state)
-        if ema_params is not None:
-            ema_params = update_ema_params(ema_params, state.params, mesa_beta)
 
-    return state, np.mean(np.asarray(batch_losses)), step, ema_params
+    return state, np.mean(np.asarray(batch_losses)), step
 
 
 def calibration_epoch(state, rng, model, trainloader, seq_len, in_dim, batchnorm):
@@ -626,15 +619,6 @@ def cvar_top_mean(losses, cvar_fraction):
     return np.mean(top_losses)
 
 
-def update_ema_params(ema_params, params, beta):
-    beta = float(beta)
-    return jax.tree_util.tree_map(
-        lambda ema, current: beta * ema + (1.0 - beta) * current,
-        ema_params,
-        params,
-    )
-
-
 def physical_noise_cvar_train_step(
     state,
     rngs,
@@ -647,13 +631,10 @@ def physical_noise_cvar_train_step(
     ssm_param,
     consistency_weight,
     cvar_fraction,
-    ema_params=None,
-    mesa_weight=0.0,
 ):
     if batchnorm:
         raise ValueError("physical_noise_cvar variation-aware training requires batchnorm=False.")
-    mesa_weight = float(mesa_weight)
-    if float(sigma) <= 0.0 and mesa_weight <= 0.0:
+    if float(sigma) <= 0.0:
         rng = np.asarray(rngs)[0]
         return train_step(
             state,
@@ -664,11 +645,8 @@ def physical_noise_cvar_train_step(
             model,
             batchnorm,
         )
-    if ema_params is None:
-        ema_params = state.params
     return _physical_noise_cvar_train_step(
         state,
-        ema_params,
         rngs,
         batch_inputs,
         batch_labels,
@@ -679,14 +657,12 @@ def physical_noise_cvar_train_step(
         ssm_param,
         float(consistency_weight),
         float(cvar_fraction),
-        mesa_weight,
     )
 
 
-@partial(jax.jit, static_argnums=(6, 7, 8, 9, 10, 11, 12))
+@partial(jax.jit, static_argnums=(5, 6, 7, 8, 9, 10))
 def _physical_noise_cvar_train_step(
     state,
-    ema_params,
     rngs,
     batch_inputs,
     batch_labels,
@@ -697,7 +673,6 @@ def _physical_noise_cvar_train_step(
     ssm_param,
     consistency_weight,
     cvar_fraction,
-    mesa_weight,
 ):
     rngs = np.asarray(rngs)
 
@@ -728,15 +703,8 @@ def _physical_noise_cvar_train_step(
         noisy_losses, consistency_losses = jax.vmap(noisy_loss)(rngs)
         noisy_cvar_ce = cvar_top_mean(noisy_losses, cvar_fraction)
         consistency_kl = np.mean(consistency_losses)
-        if mesa_weight > 0.0:
-            ema_logits = jax.lax.stop_gradient(apply_params(ema_params, rngs[0]))
-            ema_probs = jax.lax.stop_gradient(np.exp(ema_logits))
-            mesa_kl = np.mean(np.sum(ema_probs * (ema_logits - nominal_logits), axis=-1))
-        else:
-            mesa_kl = 0.0
         loss = 0.5 * nominal_ce + 0.5 * noisy_cvar_ce + consistency_weight * consistency_kl
-        loss = loss + mesa_weight * mesa_kl
-        return loss, (nominal_ce, noisy_cvar_ce, consistency_kl, mesa_kl)
+        return loss, (nominal_ce, noisy_cvar_ce, consistency_kl)
 
     (loss, _metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
