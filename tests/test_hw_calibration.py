@@ -426,6 +426,7 @@ def test_run_train_exposes_variation_aware_cli_flags():
     assert "--hw_variation_aware_select_metric" in result.stdout
     assert "--hw_variation_aware_select_sigma" in result.stdout
     assert "--hw_variation_aware_select_samples" in result.stdout
+    assert "--hw_variation_aware_nominal_gate" in result.stdout
     assert "--hw_variation_aware_loss" in result.stdout
     assert "--hw_variation_aware_consistency_weight" in result.stdout
     assert "--hw_variation_aware_cvar_fraction" in result.stdout

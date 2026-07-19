@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ucr_tdi_small
+#SBATCH --job-name=mnist_d24
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
@@ -11,15 +11,16 @@ source ~/anaconda3/etc/profile.d/conda.sh
 conda activate s5
 
 p=resonant_2x2
+tag=exp2_dmodel24
 for seed in 0 1 2 3 4; do
-  base=checkpoints/mnist_${p}_seed${seed}_params
-  echo "Running ssm_param=$p seed=$seed"
+  base=checkpoints/mnist_${p}_${tag}_seed${seed}_params
+  echo "Running exp=$tag ssm_param=$p seed=$seed"
 
   python run_train.py \
     dataset=mnist-classification \
     model.ssm_param=$p \
     n_layers=2 \
-    d_model=16 \
+    d_model=24 \
     ssm_size_base=64 \
     blocks=1 \
     mode=last \
@@ -63,16 +64,16 @@ for seed in 0 1 2 3 4; do
     hw_variation_aware_params_out=${base}_variation_aware.msgpack
 done
 
-echo "Running MNIST variation sweep"
+echo "Running MNIST variation sweep for $tag"
 python -m spice.digital_variation_test \
-  --params "checkpoints/mnist_${p}_seed*_params_calibrated.msgpack" \
-           "checkpoints/mnist_${p}_seed*_params_variation_aware.msgpack" \
-  --out-dir out/mnist_variation_sweep \
+  --params "checkpoints/mnist_${p}_${tag}_seed*_params_calibrated.msgpack" \
+           "checkpoints/mnist_${p}_${tag}_seed*_params_variation_aware.msgpack" \
+  --out-dir out/mnist_variation_sweep_${tag} \
   --dataset mnist-classification \
   --ssm-param "$p" \
   --sample-rate 160000 \
   --n-layers 2 \
-  --d-model 16 \
+  --d-model 24 \
   --ssm-size-base 64 \
   --blocks 1 \
   --mode last \

@@ -137,6 +137,8 @@ if __name__ == "__main__":
 						help="Fraction of variation-aware train samples kept at sigma=0 to preserve nominal accuracy.")
 	parser.add_argument("--hw_variation_aware_select_metric", type=str, default="mean_acc", choices=["mean_acc", "mean_std", "mean_std_strong", "min_acc", "p10_acc"],
 						help="Metric used to select the best variation-aware checkpoint.")
+	parser.add_argument("--hw_variation_aware_nominal_gate", type=float, default=0.0,
+						help="Minimum nominal validation accuracy required for variation-aware checkpoint selection. Disabled when <= 0.")
 	parser.add_argument("--hw_variation_aware_loss", type=str, default="projected_eot", choices=["projected_eot", "physical_noise_cvar"],
 						help="Variation-aware training loss: projected EOT offsets or differentiable physical-noise CVaR.")
 	parser.add_argument("--hw_variation_aware_consistency_weight", type=float, default=0.5,

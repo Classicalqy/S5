@@ -856,6 +856,7 @@ def train(args):
             aware_select_sigma = _hw_variation_aware_select_sigma(args)
             aware_select_samples = _hw_variation_aware_select_samples(args)
             aware_select_metric = getattr(args, "hw_variation_aware_select_metric", "mean_acc")
+            aware_nominal_gate = max(0.0, float(getattr(args, "hw_variation_aware_nominal_gate", 0.0)))
             aware_loss = getattr(args, "hw_variation_aware_loss", "projected_eot")
             aware_consistency_weight = float(getattr(args, "hw_variation_aware_consistency_weight", 0.5))
             aware_cvar_fraction = float(getattr(args, "hw_variation_aware_cvar_fraction", 0.5))
@@ -869,7 +870,8 @@ def train(args):
             nominal_config = _hw_projection_config(args, variation_sigma=0.0)
             print(
                 "[*] Starting variation-aware analog calibration with sigma_schedule={}, "
-                "loss={}, train_samples={}, nominal_train_samples={}, select_sigma={}, select_samples={}, select_metric={}...".format(
+                "loss={}, train_samples={}, nominal_train_samples={}, select_sigma={}, select_samples={}, "
+                "select_metric={}, nominal_gate={:.6g}...".format(
                     ",".join("{:.6g}".format(sigma) for sigma in aware_sigma_schedule),
                     aware_loss,
                     aware_train_samples,
@@ -877,6 +879,7 @@ def train(args):
                     aware_select_sigma,
                     aware_select_samples,
                     aware_select_metric,
+                    aware_nominal_gate,
                 )
             )
 
@@ -898,9 +901,10 @@ def train(args):
 
             best_aware_master_params = state.params
             best_aware_batch_stats = state.batch_stats if args.batchnorm and hasattr(state, "batch_stats") else None
-            best_aware_loss, best_aware_acc = 100000000, -100000000.0
-            best_aware_test_loss, best_aware_test_acc = 100000000, -100000000.0
+            best_aware_loss, best_aware_acc = best_calibrated_loss, best_calibrated_acc
+            best_aware_test_loss, best_aware_test_acc = best_calibrated_test_loss, best_calibrated_test_acc
             best_aware_epoch = 0
+            best_aware_selected = False
 
             for aware_epoch in range(int(args.hw_variation_aware_epochs)):
                 aware_sigma = _hw_variation_aware_epoch_sigma(args, aware_epoch)
@@ -1058,6 +1062,46 @@ def train(args):
                 aware_val_acc = _hw_variation_aware_score(val_accs, aware_select_metric)
                 aware_test_loss = float(np.mean(np.asarray(test_losses, dtype=np.float32)))
                 aware_test_acc = float(np.mean(np.asarray(test_accs, dtype=np.float32)))
+                nominal_eval_params, _nominal_projection_report = project_params_tree(
+                    params=state.params,
+                    ssm_param=args.ssm_param,
+                    sample_rate=getattr(args, "hw_sample_rate", 16000.0),
+                    projection_config=nominal_config,
+                )
+                nominal_eval_state = state.replace(params=nominal_eval_params)
+                if valloader is not None:
+                    print(f"[*] Running HW Variation-Aware Epoch {aware_epoch + 1} Nominal Validation...")
+                    aware_nominal_val_loss, aware_nominal_val_acc = validate(
+                        nominal_eval_state,
+                        model_cls,
+                        valloader,
+                        seq_len,
+                        in_dim,
+                        args.batchnorm,
+                    )
+                    print(f"[*] Running HW Variation-Aware Epoch {aware_epoch + 1} Nominal Test...")
+                    aware_nominal_test_loss, aware_nominal_test_acc = validate(
+                        nominal_eval_state,
+                        model_cls,
+                        testloader,
+                        seq_len,
+                        in_dim,
+                        args.batchnorm,
+                    )
+                else:
+                    print(f"[*] Running HW Variation-Aware Epoch {aware_epoch + 1} Nominal Test...")
+                    aware_nominal_val_loss, aware_nominal_val_acc = validate(
+                        nominal_eval_state,
+                        model_cls,
+                        testloader,
+                        seq_len,
+                        in_dim,
+                        args.batchnorm,
+                    )
+                    aware_nominal_test_loss, aware_nominal_test_acc = aware_nominal_val_loss, aware_nominal_val_acc
+                aware_nominal_val_acc = float(aware_nominal_val_acc)
+                aware_nominal_test_acc = float(aware_nominal_test_acc)
+                nominal_gate_pass = aware_nominal_gate <= 0.0 or aware_nominal_val_acc >= aware_nominal_gate
                 aggregate = projection_report.get("aggregate", {})
                 print(f"\n=>> HW Variation-Aware Epoch {aware_epoch + 1} Metrics ===")
                 print(
@@ -1065,15 +1109,18 @@ def train(args):
                     f" Mean Var Test Loss: {aware_test_loss:.5f} -- Mean Var Val Accuracy: {aware_val_acc:.4f}"
                     f" Mean Var Test Accuracy: {aware_test_acc:.4f} -- Train Sigma: {aware_sigma:.6g}"
                     f" -- Selection Sigma: {aware_select_sigma:.6g}"
+                    f" -- Nominal Val Accuracy: {aware_nominal_val_acc:.4f}"
+                    f" -- Nominal Gate Pass: {nominal_gate_pass}"
                 )
 
-                if aware_val_acc > best_aware_acc:
+                if nominal_gate_pass and (not best_aware_selected or aware_val_acc > best_aware_acc):
                     best_aware_loss = aware_val_loss
                     best_aware_acc = aware_val_acc
                     best_aware_test_loss = aware_test_loss
                     best_aware_test_acc = aware_test_acc
                     best_aware_epoch = aware_epoch
                     best_aware_master_params = state.params
+                    best_aware_selected = True
                     if args.batchnorm and hasattr(state, "batch_stats"):
                         best_aware_batch_stats = state.batch_stats
 
@@ -1086,7 +1133,16 @@ def train(args):
                         "HW Variation-Aware Test Accuracy": aware_test_acc,
                         "HW Variation-Aware Train Sigma": aware_sigma,
                         "HW Variation-Aware Selection Sigma": aware_select_sigma,
+                        "HW Variation-Aware Nominal Val Accuracy": aware_nominal_val_acc,
+                        "HW Variation-Aware Nominal Test Accuracy": aware_nominal_test_acc,
+                        "HW Variation-Aware Nominal Gate Pass": float(nominal_gate_pass),
                     }
+                )
+
+            if aware_nominal_gate > 0.0 and not best_aware_selected:
+                print(
+                    "[!] No variation-aware checkpoint passed nominal_gate={:.6g}; "
+                    "keeping the best nominal calibrated params.".format(aware_nominal_gate)
                 )
 
             best_aware_params, projection_report = project_params_tree(
