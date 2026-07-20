@@ -19,7 +19,7 @@ for seed in 0 1 2 3 4; do
     dataset=mnist-classification \
     model.ssm_param=$p \
     n_layers=2 \
-    d_model=16 \
+    d_model=24 \
     ssm_size_base=64 \
     blocks=1 \
     mode=last \
@@ -72,7 +72,7 @@ python -m spice.digital_variation_test \
   --ssm-param "$p" \
   --sample-rate 160000 \
   --n-layers 2 \
-  --d-model 16 \
+  --d-model 24 \
   --ssm-size-base 64 \
   --blocks 1 \
   --mode last \
