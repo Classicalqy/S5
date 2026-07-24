@@ -190,49 +190,35 @@ class _SpeechCommands(torch.utils.data.TensorDataset):
             dropped_rate: float,  # rate at which samples are dropped, lies in [0, 100.]
             path: str,
             all_classes: bool = False,
+            split_policy: str = "stratified",
             gen: bool = False,  # whether we are doing speech generation
             discrete_input: bool = False,  # whether we are using discrete inputs
     ):
         self.dropped_rate = dropped_rate
         self.all_classes = all_classes
+        if split_policy not in {"stratified", "official"}:
+            raise ValueError("split_policy must be 'stratified' or 'official'.")
+        self.split_policy = split_policy
         self.gen = gen
         self.discrete_input = discrete_input
 
         self.root = pathlib.Path(path)  # pathlib.Path("./data")
         base_loc = self.root / "SpeechCommands" / "processed_data"
-
-
-        if mfcc:
-            data_loc = base_loc / "mfcc"
-        elif gen:
-            data_loc = base_loc / "gen"
-        else:
-            data_loc = base_loc / "raw"
-
-            if self.dropped_rate != 0:
-                data_loc = pathlib.Path(
-                    str(data_loc) + "_dropped{}".format(self.dropped_rate)
-                )
-
-        if self.all_classes:
-            data_loc = pathlib.Path(str(data_loc) + "_all_classes")
-
-        if self.discrete_input:
-            data_loc = pathlib.Path(str(data_loc) + "_discrete")
+        data_loc = self._data_location(base_loc, mfcc)
 
         if os.path.exists(data_loc):
             pass
         else:
             self.download()
-            if not self.all_classes:
-                train_X, val_X, test_X, train_y, val_y, test_y = self._process_data(mfcc)
-            else:
+            if self.all_classes:
                 train_X, val_X, test_X, train_y, val_y, test_y = self._process_all(mfcc)
+            elif self.split_policy == "official":
+                train_X, val_X, test_X, train_y, val_y, test_y = self._process_official_subset(mfcc)
+            else:
+                train_X, val_X, test_X, train_y, val_y, test_y = self._process_data(mfcc)
 
-            if not os.path.exists(base_loc):
-                os.mkdir(base_loc)
-            if not os.path.exists(data_loc):
-                os.mkdir(data_loc)
+            base_loc.mkdir(parents=True, exist_ok=True)
+            data_loc.mkdir(parents=True, exist_ok=True)
             save_data(
                 data_loc,
                 train_X=train_X,
@@ -258,6 +244,30 @@ class _SpeechCommands(torch.utils.data.TensorDataset):
 
         super(_SpeechCommands, self).__init__(X, y)
 
+    def _data_location(self, base_loc, mfcc):
+        """Return a cache location that encodes the class set and split policy."""
+        if mfcc:
+            data_loc = base_loc / "mfcc"
+        elif self.gen:
+            data_loc = base_loc / "gen"
+        else:
+            data_loc = base_loc / "raw"
+            if self.dropped_rate != 0:
+                data_loc = pathlib.Path(
+                    str(data_loc) + "_dropped{}".format(self.dropped_rate)
+                )
+
+        if self.all_classes:
+            data_loc = pathlib.Path(str(data_loc) + "_all_classes")
+        elif self.split_policy == "official":
+            # Do not reuse the legacy subset cache, which was built with a
+            # random 70/15/15 split rather than the dataset's official lists.
+            data_loc = pathlib.Path(str(data_loc) + "_sc10_official")
+
+        if self.discrete_input:
+            data_loc = pathlib.Path(str(data_loc) + "_discrete")
+        return data_loc
+
     def download(self):
         root = self.root
         base_loc = root / "SpeechCommands"
@@ -273,6 +283,72 @@ class _SpeechCommands(torch.utils.data.TensorDataset):
         )  # TODO: Add progress bar
         with tarfile.open(loc, "r") as f:
             f.extractall(base_loc)
+
+    @staticmethod
+    def _pad_or_trim_audio(audio, length=16000):
+        """Convert a waveform to a mono, fixed-length, zero-padded signal."""
+        if audio.ndim == 1:
+            audio = audio[:, None]
+        if audio.shape[1] != 1:
+            audio = audio[:, :1]
+        audio = audio[:length]
+        return F.pad(audio, (0, 0, 0, length - audio.shape[0]))
+
+    def _process_official_subset(self, mfcc):
+        """Process the ten command words using the official v0.02 split lists."""
+        assert self.dropped_rate == 0, "Dropped rate must be 0 for the official SC10 split"
+        base_loc = self.root / "SpeechCommands"
+
+        with open(base_loc / "validation_list.txt", "r") as f:
+            validation_list = {line.rstrip() for line in f}
+        with open(base_loc / "testing_list.txt", "r") as f:
+            testing_list = {line.rstrip() for line in f}
+
+        split_audio = {"train": [], "val": [], "test": []}
+        split_labels = {"train": [], "val": [], "test": []}
+        for label, foldername in enumerate(self.SUBSET_CLASSES):
+            loc = base_loc / foldername
+            for filename in sorted(os.listdir(loc)):
+                relative_path = f"{foldername}/{filename}"
+                audio, _ = torchaudio.load(loc / filename, channels_first=False)
+                audio = self._pad_or_trim_audio(audio / 2 ** 15)
+
+                if relative_path in validation_list:
+                    split = "val"
+                elif relative_path in testing_list:
+                    split = "test"
+                else:
+                    split = "train"
+                split_audio[split].append(audio)
+                split_labels[split].append(label)
+
+        train_X = torch.stack(split_audio["train"])
+        val_X = torch.stack(split_audio["val"])
+        test_X = torch.stack(split_audio["test"])
+        train_y = torch.tensor(split_labels["train"], dtype=torch.long)
+        val_y = torch.tensor(split_labels["val"], dtype=torch.long)
+        test_y = torch.tensor(split_labels["test"], dtype=torch.long)
+
+        if mfcc:
+            transform = torchaudio.transforms.MFCC(
+                log_mels=True, n_mfcc=20, melkwargs=dict(n_fft=200, n_mels=64)
+            )
+            train_X = transform(train_X.squeeze(-1)).detach()
+            val_X = transform(val_X.squeeze(-1)).detach()
+            test_X = transform(test_X.squeeze(-1)).detach()
+            train_X, val_X, test_X = normalize_all_data(
+                train_X.transpose(1, 2), val_X.transpose(1, 2), test_X.transpose(1, 2)
+            )
+            train_X = train_X.transpose(1, 2)
+            val_X = val_X.transpose(1, 2)
+            test_X = test_X.transpose(1, 2)
+        else:
+            train_X = train_X.unsqueeze(1).squeeze(-1)
+            val_X = val_X.unsqueeze(1).squeeze(-1)
+            test_X = test_X.unsqueeze(1).squeeze(-1)
+            train_X, val_X, test_X = normalize_all_data(train_X, val_X, test_X)
+
+        return train_X, val_X, test_X, train_y, val_y, test_y
 
     def _process_all(self, mfcc):
         assert self.dropped_rate == 0, "Dropped rate must be 0 for all classes"

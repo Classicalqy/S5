@@ -290,6 +290,42 @@ def create_speechcommands35_classification_dataset(cache_dir: Union[str, Path] =
 	return trn_loader, val_loader, tst_loader, aux_loaders, N_CLASSES, SEQ_LENGTH, IN_DIM, TRAIN_SIZE
 
 
+def create_speechcommands10_classification_dataset(cache_dir: Union[str, Path] = DEFAULT_CACHE_DIR_ROOT,
+											   bsz: int = 50,
+											   seed: int = 42) -> ReturnType:
+	"""Create the official Speech Commands v0.02 ten-command classification split."""
+	print("[*] Generating SpeechCommands10 Classification Dataset (official split)")
+	from s5.dataloaders.basic import SpeechCommands
+
+	dir_name = './raw_datasets/speech_commands/0.0.2/'
+	os.makedirs(dir_name, exist_ok=True)
+	kwargs = {
+		'all_classes': False,
+		'split_policy': 'official',
+		'sr': 1,
+	}
+	dataset_obj = SpeechCommands('sc', data_dir=dir_name, **kwargs)
+	dataset_obj.setup()
+	trn_loader = make_data_loader(dataset_obj.dataset_train, dataset_obj, seed=seed, batch_size=bsz)
+	val_loader = make_data_loader(dataset_obj.dataset_val, dataset_obj, seed=seed, batch_size=bsz, drop_last=False, shuffle=False)
+	tst_loader = make_data_loader(dataset_obj.dataset_test, dataset_obj, seed=seed, batch_size=bsz, drop_last=False, shuffle=False)
+
+	N_CLASSES = dataset_obj.d_output
+	SEQ_LENGTH = dataset_obj.dataset_train.tensors[0].shape[1]
+	IN_DIM = dataset_obj.d_input
+	TRAIN_SIZE = dataset_obj.dataset_train.tensors[0].shape[0]
+
+	kwargs['sr'] = 2
+	dataset_obj = SpeechCommands('sc', data_dir=dir_name, **kwargs)
+	dataset_obj.setup()
+	aux_loaders = {
+		'valloader2': make_data_loader(dataset_obj.dataset_val, dataset_obj, seed=seed, batch_size=bsz, drop_last=False, shuffle=False),
+		'testloader2': make_data_loader(dataset_obj.dataset_test, dataset_obj, seed=seed, batch_size=bsz, drop_last=False, shuffle=False),
+	}
+
+	return trn_loader, val_loader, tst_loader, aux_loaders, N_CLASSES, SEQ_LENGTH, IN_DIM, TRAIN_SIZE
+
+
 def create_cifar_classification_dataset(cache_dir: Union[str, Path] = DEFAULT_CACHE_DIR_ROOT,
 										seed: int = 42,
 										bsz: int=128) -> ReturnType:
@@ -609,5 +645,6 @@ Datasets = {
 	"pathx-classification": create_lra_pathx_classification_dataset,
 
 	# Speech.
+	"speech10-classification": create_speechcommands10_classification_dataset,
 	"speech35-classification": create_speechcommands35_classification_dataset,
 }

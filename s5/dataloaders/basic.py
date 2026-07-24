@@ -214,6 +214,7 @@ class SpeechCommands(ResolutionSequenceDataset):
             "dropped_rate": 0.0,
             "length": 16000,
             "all_classes": False,
+            "split_policy": "stratified",
         }
 
     @property
@@ -249,6 +250,7 @@ class SpeechCommands(ResolutionSequenceDataset):
             dropped_rate=self.dropped_rate,
             path=self.data_dir,
             all_classes=self.all_classes,
+            split_policy=self.split_policy,
         )
 
         self.dataset_val = _SpeechCommands(
@@ -259,6 +261,7 @@ class SpeechCommands(ResolutionSequenceDataset):
             dropped_rate=self.dropped_rate,
             path=self.data_dir,
             all_classes=self.all_classes,
+            split_policy=self.split_policy,
         )
 
         self.dataset_test = _SpeechCommands(
@@ -269,4 +272,5 @@ class SpeechCommands(ResolutionSequenceDataset):
             dropped_rate=self.dropped_rate,
             path=self.data_dir,
             all_classes=self.all_classes,
+            split_policy=self.split_policy,
         )
