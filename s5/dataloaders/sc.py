@@ -7,11 +7,53 @@ import os
 import pathlib
 import tarfile
 import urllib.request
+import wave
 
+import numpy as np
 import sklearn.model_selection
 import torch
 import torch.nn.functional as F
 import torchaudio
+
+
+_AUDIO_LOADER = None
+
+
+def _load_pcm_wave(path):
+    """Load an uncompressed PCM WAV without requiring TorchCodec."""
+    with wave.open(str(path), "rb") as handle:
+        if handle.getcomptype() != "NONE":
+            raise ValueError(f"Only uncompressed PCM WAV files are supported: {path}")
+        sample_width = handle.getsampwidth()
+        dtype = {1: np.uint8, 2: np.int16, 4: np.int32}.get(sample_width)
+        if dtype is None:
+            raise ValueError(f"Unsupported WAV sample width ({sample_width} bytes): {path}")
+        channels = handle.getnchannels()
+        sample_rate = handle.getframerate()
+        samples = np.frombuffer(handle.readframes(handle.getnframes()), dtype=dtype).copy()
+
+    if sample_width == 1:
+        samples = samples.astype(np.int16) - 128
+    waveform = torch.from_numpy(samples).reshape(-1, channels)
+    return waveform, sample_rate
+
+
+def load_audio(path):
+    """Load an audio file, falling back to stdlib WAV decoding without TorchCodec."""
+    global _AUDIO_LOADER
+    if _AUDIO_LOADER == "wave":
+        return _load_pcm_wave(path)
+
+    try:
+        waveform, sample_rate = torchaudio.load(path, channels_first=False)
+    except ImportError as exc:
+        if "TorchCodec" not in str(exc):
+            raise
+        _AUDIO_LOADER = "wave"
+        return _load_pcm_wave(path)
+
+    _AUDIO_LOADER = "torchaudio"
+    return waveform, sample_rate
 
 
 def pad(channel, maxlen):
@@ -310,7 +352,7 @@ class _SpeechCommands(torch.utils.data.TensorDataset):
             loc = base_loc / foldername
             for filename in sorted(os.listdir(loc)):
                 relative_path = f"{foldername}/{filename}"
-                audio, _ = torchaudio.load(loc / filename, channels_first=False)
+                audio, _ = load_audio(loc / filename)
                 audio = self._pad_or_trim_audio(audio / 2 ** 15)
 
                 if relative_path in validation_list:
@@ -369,9 +411,7 @@ class _SpeechCommands(torch.utils.data.TensorDataset):
             print(foldername)
             loc = base_loc / foldername
             for filename in os.listdir(loc):
-                audio, _ = torchaudio.load(
-                    loc / filename, channels_first=False,
-                )
+                audio, _ = load_audio(loc / filename)
                 audio = (
                         audio / 2 ** 15
                 )
@@ -457,9 +497,7 @@ class _SpeechCommands(torch.utils.data.TensorDataset):
         for foldername in self.SUBSET_CLASSES:
             loc = base_loc / foldername
             for filename in os.listdir(loc):
-                audio, _ = torchaudio.load(
-                    loc / filename, channels_first=False,
-                )
+                audio, _ = load_audio(loc / filename)
                 # audio, _ = torchaudio.load_wav(
                 #     loc / filename, channels_first=False, normalization=False
                 # )  # for forward compatbility if they fix it

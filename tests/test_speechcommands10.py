@@ -1,5 +1,7 @@
 from pathlib import Path
+import wave
 
+import numpy as np
 import torch
 
 from s5 import dataloading
@@ -51,6 +53,7 @@ def test_sc10_official_processing_uses_lists_labels_and_zero_padding(monkeypatch
         sample_len = 4 if path.name == "val.wav" else 6
         return torch.ones((sample_len, 1)), 16000
 
+    monkeypatch.setattr(sc, "_AUDIO_LOADER", None)
     monkeypatch.setattr(sc.torchaudio, "load", fake_load)
     dataset = _loader_instance(tmp_path, "official")
     train_X, val_X, test_X, train_y, val_y, test_y = dataset._process_official_subset(mfcc=False)
@@ -62,6 +65,28 @@ def test_sc10_official_processing_uses_lists_labels_and_zero_padding(monkeypatch
     padded = sc._SpeechCommands._pad_or_trim_audio(torch.ones((4, 1)))
     assert torch.equal(padded[:4], torch.ones((4, 1)))
     assert torch.count_nonzero(padded[4:]) == 0
+
+
+def test_speech_commands_falls_back_to_pcm_wave_without_torchcodec(monkeypatch, tmp_path):
+    wav_path = tmp_path / "sample.wav"
+    samples = np.array([0, 1024, -1024, 32767], dtype=np.int16)
+    with wave.open(str(wav_path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(samples.tobytes())
+
+    def missing_torchcodec(*args, **kwargs):
+        raise ImportError("TorchCodec is required for load_with_torchcodec")
+
+    monkeypatch.setattr(sc, "_AUDIO_LOADER", None)
+    monkeypatch.setattr(sc.torchaudio, "load", missing_torchcodec)
+    waveform, sample_rate = sc.load_audio(wav_path)
+
+    assert sample_rate == 16000
+    assert waveform.shape == (4, 1)
+    assert waveform[:, 0].tolist() == samples.tolist()
+    assert sc._AUDIO_LOADER == "wave"
 
 
 def test_speech10_factory_uses_official_raw_configuration(monkeypatch, tmp_path):
