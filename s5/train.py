@@ -265,7 +265,7 @@ def train(args):
         retrieval = False
 
     # For speech dataset
-    if args.dataset in ["speech35-classification"]:
+    if args.dataset in ["speech10-classification", "speech35-classification"]:
         speech = True
         print("Will evaluate on both resolutions for speech task")
     else:
